@@ -1,0 +1,27 @@
+[project]
+name = "training-lora-clothing"
+version = "0.1.0"
+description = "Offline costume LoRA dataset preparation"
+requires-python = ">=3.11,<3.13"
+dependencies = ["numpy>=1.26,<3", "pillow>=10.4,<13"]
+
+[project.optional-dependencies]
+inference = [
+  "torch>=2.6,<3",
+  "torchvision>=0.21,<1",
+  "transformers==4.51.3",
+  "accelerate>=1.2,<2",
+  "onnxruntime>=1.20,<2",
+  "safetensors>=0.5,<1",
+]
+quantization = ["bitsandbytes>=0.45,<1"]
+
+# Windows: PyPI only ships CPU-only torch. Use the CUDA 13.0 build from PyTorch's own index.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

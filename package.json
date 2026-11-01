@@ -1,0 +1,18 @@
+{
+  "name": "costume-lora-studio",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.30.3",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "build:bundled": "tauri build --config src-tauri/tauri.bundle.conf.json",
+    "test": "node --test ui/tests/*.test.mjs",
+    "check": "node --check ui/app.js",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.0"
+  }
+}
