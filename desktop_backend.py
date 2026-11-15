@@ -505,7 +505,10 @@ def engine_args(engine: Path) -> set:
 
 
 def training_plan(payload: dict) -> dict:
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ModuleNotFoundError as error:
+        raise ValueError(f"The Training Python ({sys.executable}) is not the training environment (missing {error.name}). In Environment, set Training Python to .training-env/.venv/Scripts/python.exe (see DESKTOP.md).") from error
 
     alpha_mask = flag(payload, "alpha_mask", False)
     use_masks = flag(payload, "use_masks", True) and not alpha_mask

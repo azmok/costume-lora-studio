@@ -8,6 +8,8 @@ import subprocess
 def main():
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--engine", type=Path, required=True)
+    cli.add_argument("--torch-index", default="https://download.pytorch.org/whl/cu130",
+                     help="PyTorch wheel index (default: CUDA 13.0)")
     args = cli.parse_args()
     engine = args.engine.resolve()
     if not (engine / "train_network.py").is_file():
@@ -16,7 +18,7 @@ def main():
     environment = project / ".training-env"
     if environment.exists():
         raise ValueError(".training-env は既にあります。既存環境の uv sync を使ってください")
-    subprocess.run(["uv", "init", "--bare", "--python", "3.12", str(environment)], check=True)
+    subprocess.run(["uv", "init", "--bare", "--name", "training-env", "--no-workspace", "--python", "3.12", str(environment)], check=True)
     requirements = []
     for line in (engine / "requirements.txt").read_text(encoding="utf-8-sig").splitlines():
         stripped = line.strip()
@@ -28,7 +30,10 @@ def main():
     filtered = environment / "requirements-sd.txt"
     filtered.write_text("\n".join(requirements) + "\n", encoding="utf-8")
     subprocess.run(["uv", "add", "--project", str(environment), "--python", "3.12", "--no-sync", "--requirements", str(filtered)], check=True)
-    subprocess.run(["uv", "add", "--project", str(environment), "--python", "3.12", "torch", "torchvision", "pillow"], check=True)
+    # PyPI only has CPU builds of torch for Windows: take torch / torchvision from the PyTorch CUDA index.
+    subprocess.run(["uv", "add", "--project", str(environment), "--python", "3.12", "--index", f"pytorch={args.torch_index}",
+                    "torch", "torchvision"], check=True)
+    subprocess.run(["uv", "add", "--project", str(environment), "--python", "3.12", "pillow"], check=True)
     print(f"学習用 Python: {environment / '.venv' / 'Scripts' / 'python.exe'}")
     print("CUDA availability must be checked before training.")
 
