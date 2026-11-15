@@ -33,6 +33,7 @@
     "resources": {
       "../dataset_generator.py": "backend/dataset_generator.py",
       "../model_download.py": "backend/model_download.py",
+      "../comfy_setup.py": "backend/comfy_setup.py",
       "../desktop_backend.py": "backend/desktop_backend.py"
     },
     "windows": {

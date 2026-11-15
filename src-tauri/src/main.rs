@@ -18,6 +18,8 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+mod comfy;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Settings {
     python_path: String,
@@ -235,6 +237,7 @@ fn start_job(
         "train",
         "validate",
         "download",
+        "comfy_install",
     ]
     .contains(&kind.as_str())
         || !payload.is_object()
@@ -279,6 +282,14 @@ fn start_job(
     ] {
         payload[key] = Value::String(value.clone());
     }
+    let config = comfy::load_config(&app);
+    payload["lora_output_dir"] = Value::String(config.lora_output_dir.clone());
+    payload["comfy_install_dir"] = Value::String(config.managed_dir.clone());
+    // Only SD1.5 training runs fully offline; other model types and installs fetch tokenizers / packages.
+    let online = kind == "comfy_install"
+        || kind == "download"
+        || ((kind == "train" || kind == "validate")
+            && payload.get("model_family").and_then(Value::as_str).is_some_and(|family| family != "sd15"));
     fs::write(
         &request_path,
         serde_json::to_vec(&json!({"kind": kind, "payload": payload}))
@@ -296,9 +307,10 @@ fn start_job(
         .stderr(Stdio::piped())
         .env("PYTHONUNBUFFERED", "1")
         .env("PYTHONUTF8", "1")
-        .env("HF_HUB_OFFLINE", "1")
-        .env("TRANSFORMERS_OFFLINE", "1")
         .current_dir(backend.parent().unwrap());
+    if !online {
+        command.env("HF_HUB_OFFLINE", "1").env("TRANSFORMERS_OFFLINE", "1");
+    }
     hide(&mut command);
     let mut child = command
         .spawn()
@@ -735,6 +747,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(JobState::default())
+        .manage(comfy::ComfyState::default())
         .invoke_handler(tauri::generate_handler![
             load_settings,
             save_settings,
@@ -746,11 +759,20 @@ fn main() {
             preview_image,
             save_tool_mask,
             save_tool_caption,
-            load_tool_caption
+            load_tool_caption,
+            comfy::app_config,
+            comfy::comfy_status,
+            comfy::comfy_start,
+            comfy::comfy_stop,
+            comfy::comfy_http,
+            comfy::open_comfy_window
         ])
         .build(tauri::generate_context!())
         .expect("Failed to initialize Tauri")
         .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                comfy::shutdown(app);
+            }
             if let tauri::RunEvent::ExitRequested { api, .. } = event {
                 if let Ok(session) = app.state::<JobState>().0.lock() {
                     if session.running.is_some() {

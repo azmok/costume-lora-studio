@@ -1,0 +1,20 @@
+# Costume LoRA Studio settings. Copy this file to settings.yaml (next to the app, or in the repository root)
+# and change what you need. Every key is optional; unknown keys are reported as an error in the ComfyUI tab.
+
+# Where finished LoRAs are copied (each LoRA gets its own sub folder with its step versions).
+# Default: G:/sd/sharedModels/loras when drive G: exists, else the app's local data folder.
+lora_output_dir: G:/sd/sharedModels/loras
+
+# Your ComfyUI. Leave this section out to use the ComfyUI the app installs (ComfyUI tab > Install ComfyUI).
+comfyui:
+  # wsl: ComfyUI inside WSL (root is a Linux path). windows: a Windows ComfyUI folder (e.g. the portable build).
+  mode: wsl
+  root: /home/you/projects/sd.comfy/ComfyUI
+  # Optional. The Python that runs ComfyUI. Default: ../venv, venv or .venv next to main.py
+  # (python_embeded for the Windows portable build).
+  # python: /home/you/projects/sd.comfy/venv/bin/python
+  # Optional. The WSL distribution (wsl -l -v). Default: your default distribution.
+  # distro: Ubuntu
+  port: 8188
+  # Optional. Extra ComfyUI command line arguments.
+  # extra_args: --output-directory /mnt/g/sd/output

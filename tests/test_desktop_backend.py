@@ -630,6 +630,24 @@ class WorkflowTests(unittest.TestCase):
                 for subset in dataset["subsets"]:
                     self.assertLessEqual(set(subset), subsets)
 
+    def test_a_finished_lora_is_copied_to_the_comfyui_lora_folder(self):
+        payload = {**self.training_payload(), "lora_output_dir": str(self.root / "shared" / "loras")}
+        torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+
+        def training_stub(command, **kwargs):
+            for name in ("costume.safetensors", "costume-step00000250.safetensors"):
+                Path(payload["output_dir"], name).touch()
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict("sys.modules", {"torch": torch_stub, "transformers": SimpleNamespace(CLIPTokenizer=Mock())}):
+            with patch("desktop_backend.subprocess.run", side_effect=training_stub), patch("desktop_backend.emit") as emitted:
+                desktop.train(payload)
+        published = next(call for call in emitted.call_args_list if call.kwargs.get("type") == "published")
+        target = self.root / "shared" / "loras" / "costume"
+        self.assertEqual(published.kwargs["lora_dir"], target.as_posix())
+        self.assertEqual((published.kwargs["name"], published.kwargs["family"]), ("costume", "sd15"))
+        self.assertTrue((target / "costume.safetensors").is_file() and (target / "costume-step00000250.safetensors").is_file())
+
     def test_training_rejects_missing_masks(self):
         payload = self.training_payload()
         mask = next(Path(payload["mask_dir"]).rglob("*.png"))

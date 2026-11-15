@@ -55,6 +55,18 @@ window.__TAURI__ = {
       return '';
     }
     if (name === 'save_tool_mask' || name === 'save_tool_caption') return 'C:/out/' + args.request.image.split('/').pop();
+    if (name === 'app_config') return { source: 'C:/app/settings.yaml', error: null, lora_output_dir: 'G:/sd/sharedModels/loras',
+      comfyui: { mode: 'wsl', root: '/home/index/projects/sd.comfy/ComfyUI', python: null, distro: 'Ubuntu', port: 8188, extra_args: [], origin: 'settings' },
+      managed_dir: 'C:/data/comfyui/ComfyUI', managed_installed: false };
+    if (name === 'comfy_start') { window.comfyAt = Date.now(); return { started_by_app: true, reachable: false, url: 'http://127.0.0.1:8188/', log: 'C:/data/comfyui.log' }; }
+    if (name === 'comfy_status') { const up = Boolean(window.comfyAt); return { started_by_app: up, reachable: up && Date.now() - window.comfyAt > 300, url: 'http://127.0.0.1:8188/', log: 'C:/data/comfyui.log' }; }
+    if (name === 'comfy_stop') { window.comfyAt = 0; return { started_by_app: false, reachable: false, url: 'http://127.0.0.1:8188/', log: '' }; }
+    if (name === 'comfy_http') {
+      const node = String(args.path).split('/').pop();
+      const lists = { CheckpointLoaderSimple: ['ckpt_name', ['other.safetensors', 'v1-5-pruned.safetensors']], LoraLoader: ['lora_name', ['look/look.safetensors', 'look/look-step00000250.safetensors']] };
+      const [input, names] = lists[node];
+      return { status: 200, body: { [node]: { input: { required: { [input]: [names] } } } } };
+    }
     return null;
   } }
 };
@@ -804,6 +816,42 @@ def main():
         expect(page.locator('[data-component="clip_l"]')).to_be_hidden()
         expect(page.locator("#train-resolution")).to_have_value("512")
         expect(page.locator("#training-mode-label")).to_contain_text("SD1.5")
+        page.locator("#tab-tools").click()
+
+        # --- ComfyUI: a trained LoRA is copied to the LoRA folder and opens in ComfyUI with a test workflow ---
+        page.locator("#tab-train").click()
+        page.evaluate("window.__comfyPoll = 100")
+        page.locator("#checkpoint").fill("G:/sd/sharedModels/checkpoints/v1-5-pruned.safetensors")
+        trains = page.evaluate("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'train').length")
+        page.locator("#train-form button[type=submit]").click()
+        page.wait_for_function("(n) => window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'train').length > n", arg=trains)
+        expect(page.locator("#train-try-comfy")).to_be_hidden()
+        send(message="LoRA copied for ComfyUI", type="published", name="look", family="sd15", lora_dir="G:/sd/sharedModels/loras/look", subfolder="look",
+             files=["look-step00000250.safetensors", "look.safetensors"], final="G:/sd/sharedModels/loras/look/look.safetensors")
+        finish_job()
+        expect(page.locator("#train-try-comfy")).to_be_visible()
+        page.locator("#tab-comfy").click()
+        expect(page.locator("#comfy-where")).to_contain_text("WSL (Ubuntu)")
+        expect(page.locator("#comfy-lora-dir")).to_have_text("G:/sd/sharedModels/loras")
+        expect(page.locator("#comfy-source")).to_have_text("C:/app/settings.yaml")
+        expect(page.locator("#comfy-install")).to_be_hidden()
+        expect(page.locator("#comfy-lora option")).to_have_count(2)
+        expect(page.locator("#comfy-lora")).to_have_value("0|look.safetensors")  # the final version first
+        expect(page.locator("#comfy-prompt")).to_have_value(re.compile("adult woman"))
+        page.locator("#comfy-prompt").fill("trig, red ribbon")
+        page.locator("#comfy-try").click()
+        page.wait_for_function("window.calls.some((call) => call.name === 'open_comfy_window')", timeout=15000)
+        start = page.evaluate("window.calls.filter((call) => call.name === 'comfy_start').at(-1).args")
+        assert start["folders"]["checkpoints"] == ["G:/sd/sharedModels/checkpoints"], start
+        script = page.evaluate("window.calls.filter((call) => call.name === 'open_comfy_window').at(-1).args.script")
+        assert "look/look.safetensors" in script and "v1-5-pruned.safetensors" in script and "trig, red ribbon" in script and "loadApiJson" in script, script[:300]
+        expect(page.locator("#comfy-state")).to_contain_text("Running at")
+        page.locator("#comfy-lora").select_option("0|look-step00000250.safetensors")
+        page.locator("#comfy-try").click()
+        page.wait_for_function("window.calls.filter((call) => call.name === 'open_comfy_window').length === 2")
+        assert "look/look-step00000250.safetensors" in page.evaluate("window.calls.filter((call) => call.name === 'open_comfy_window').at(-1).args.script")
+        page.locator("#comfy-stop").click()
+        expect(page.locator("#comfy-state")).to_have_text("Stopped")
         page.locator("#tab-tools").click()
 
         # --- projects: autosave, switching, restore after reload --------------------------------

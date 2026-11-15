@@ -1,4 +1,5 @@
 import { BUILTIN_PRESETS, DEFAULT_PARAMS, OPTIMIZERS, PARAM_FIELDS, PARAM_SCHEMA, SCHEDULERS, builtinPreset, optimizerInfo, parseSpeed, summaryModel, updateSpeed } from "./training-params.mjs";
+import { buildTrialWorkflow, folderFor, loaderScript, NEEDS, supportsWorkflow, trialPrompt } from "./comfy-workflow.mjs";
 import { COMPONENT_KEYS, DEFAULT_FAMILY, FAMILIES, civitaiMismatch, downloadById, downloadItems, familyById, familyParams, normalizeDownloadLink, presetById, presetsFor } from "./model-families.mjs";
 import { PROJECT_DEFAULTS, TRAINING_DEFAULTS, required, validateTraining, applyJobEvent, makeTrainingProfile, readTrainingProfile, normalizePresetName, readPresetStore, upsertPreset, removePreset, serializePresetStore } from "./state.mjs";
 import { createTools } from "./tools.js";
@@ -88,6 +89,8 @@ function selectPage(button) {
   });
   byId("breadcrumb").textContent = button.querySelector("span").textContent;
   currentPage = page;
+  clearInterval(comfyTimer);
+  if (page === "comfy") { refreshComfy().catch(notice); comfyTimer = setInterval(() => refreshComfyState().catch(() => {}), 5000); }
   scheduleProjectSave();
   updateSelectionSummary();
   notice("");
@@ -280,6 +283,157 @@ for (const [id, key] of [["hf-token", "costume-hf-token"], ["civitai-key", "cost
   try { byId(id).value = localStorage.getItem(key) || ""; } catch { /* storage unavailable */ }
   byId(id).addEventListener("input", () => { try { localStorage.setItem(key, byId(id).value.trim()); } catch { /* storage unavailable */ } });
 }
+
+// ---- ComfyUI: settings.yaml, start / stop, and trying a trained LoRA in a separate window ----
+const LORA_HISTORY_KEY = "costume-lora-history";
+let comfyConfig = null;
+let comfyTimer = 0;
+const dirOf = (path) => String(path ?? "").replaceAll("\\", "/").replace(/\/[^/]*$/, "");
+function loraHistory() {
+  try { const data = JSON.parse(localStorage.getItem(LORA_HISTORY_KEY) || "[]"); return Array.isArray(data) ? data.filter((item) => item && item.name && Array.isArray(item.files)) : []; } catch { return []; }
+}
+function onPublished(data) {
+  const entry = {
+    name: data.name, family: data.family || lastRun?.family || "sd15", lora_dir: data.lora_dir, subfolder: data.subfolder,
+    files: data.files, final: String(data.final ?? "").split("/").at(-1), trigger: lastRun?.trigger ?? project.trigger_word,
+    paths: lastRun?.files ?? currentPaths(), at: Date.now()
+  };
+  const history = [entry, ...loraHistory().filter((item) => item.lora_dir !== entry.lora_dir)].slice(0, 20);
+  try { localStorage.setItem(LORA_HISTORY_KEY, JSON.stringify(history)); } catch { /* storage unavailable */ }
+  renderLoraChoices(0);
+  byId("train-try-comfy").hidden = false;
+}
+function renderLoraChoices(select) {
+  const history = loraHistory();
+  const box = byId("comfy-lora");
+  box.replaceChildren(...history.map((item, index) => {
+    const group = document.createElement("optgroup");
+    group.label = item.name + " — " + (familyById(item.family)?.short ?? item.family);
+    const files = [item.final, ...item.files.filter((file) => file !== item.final).sort().reverse()];
+    for (const file of files) {
+      const option = document.createElement("option");
+      option.value = index + "|" + file;
+      option.textContent = file === item.final ? file + " (final)" : file;
+      group.append(option);
+    }
+    return group;
+  }));
+  if (select !== undefined && history[select]) box.value = select + "|" + history[select].final;
+  byId("comfy-try").disabled = history.length === 0;
+  syncLoraChoice(true);
+}
+function selectedLora() {
+  const [index, file] = byId("comfy-lora").value.split("|");
+  const entry = loraHistory()[Number(index)];
+  return entry && file ? { entry, file } : null;
+}
+function syncLoraChoice(resetPrompt) {
+  const chosen = selectedLora();
+  if (!chosen) {
+    byId("comfy-lora-info").textContent = "Train a LoRA first: when training finishes it is copied to the LoRA folder and listed here.";
+    return;
+  }
+  const { entry } = chosen;
+  if (resetPrompt || !byId("comfy-prompt").value.trim()) byId("comfy-prompt").value = trialPrompt(entry.trigger);
+  byId("comfy-lora-info").textContent = "Folder: " + entry.lora_dir + (supportsWorkflow(entry.family) ? "" : " — no ready-made workflow for this model type yet: ComfyUI opens with the LoRA in its list.");
+}
+byId("comfy-lora").addEventListener("change", () => syncLoraChoice(true));
+function modelFolders(family, paths) {
+  const folders = {};
+  for (const item of (familyById(family) ?? currentFamily()).components) {
+    const path = String(paths?.[item.key] ?? "").trim();
+    if (!path) continue;
+    (folders[folderFor(family, item.key)] ??= []).push(dirOf(path));
+  }
+  return folders;
+}
+async function refreshComfy() {
+  comfyConfig = await invoke("app_config");
+  const setup = comfyConfig.comfyui;
+  byId("comfy-where").textContent = setup
+    ? (setup.mode === "wsl" ? "WSL" + (setup.distro ? " (" + setup.distro + ")" : "") : "Windows") + " · " + setup.root + (setup.origin === "managed" ? " (installed by this app)" : "")
+    : "Not set up";
+  byId("comfy-lora-dir").textContent = comfyConfig.lora_output_dir;
+  byId("comfy-source").textContent = comfyConfig.source ?? "none (defaults)";
+  byId("comfy-config-error").hidden = !comfyConfig.error;
+  byId("comfy-config-error").textContent = comfyConfig.error ?? "";
+  byId("comfy-install").hidden = Boolean(setup);
+  byId("comfy-open").disabled = !setup;
+  byId("comfy-try").disabled = !setup || loraHistory().length === 0;
+  await refreshComfyState();
+}
+async function refreshComfyState() {
+  if (!comfyConfig?.comfyui) { byId("comfy-state").textContent = "—"; return null; }
+  const status = await invoke("comfy_status");
+  byId("comfy-state").textContent = status.reachable
+    ? "Running at " + status.url + (status.started_by_app ? "" : " (started outside this app)")
+    : status.started_by_app ? "Starting… (log: " + status.log + ")" : "Stopped";
+  byId("comfy-stop").disabled = !status.started_by_app;
+  return status;
+}
+async function ensureComfy(folders) {
+  if (!comfyConfig) await refreshComfy();
+  let status = await invoke("comfy_start", { folders });
+  const started = Date.now();
+  while (!status.reachable) {
+    if (!status.started_by_app) throw new Error("ComfyUI stopped while starting. See its log: " + status.log);
+    if (Date.now() - started > 300000) throw new Error("ComfyUI did not answer within 5 minutes. See its log: " + status.log);
+    byId("comfy-state").textContent = "Starting… " + Math.round((Date.now() - started) / 1000) + " s";
+    await new Promise((resolve) => setTimeout(resolve, Number(window.__comfyPoll) || 1500));
+    status = await invoke("comfy_status");
+  }
+  await refreshComfyState();
+  return status;
+}
+async function withComfyButtons(task) {
+  const buttons = ["comfy-open", "comfy-try", "train-try-comfy"].map(byId);
+  const before = buttons.map((button) => button.disabled);
+  buttons.forEach((button) => { button.disabled = true; });
+  try { await task(); } catch (error) { notice(error); } finally { buttons.forEach((button, index) => { button.disabled = before[index]; }); }
+}
+byId("comfy-open").addEventListener("click", () => withComfyButtons(async () => {
+  notice("");
+  await ensureComfy(modelFolders(currentFamily().id, currentPaths()));
+  await invoke("open_comfy_window", { script: null });
+}));
+byId("comfy-stop").addEventListener("click", () => withComfyButtons(async () => { await invoke("comfy_stop"); await refreshComfyState(); }));
+byId("comfy-install").addEventListener("click", async () => {
+  try { await run("comfy_install", {}); } catch (error) { notice(error); }
+});
+async function tryInComfy() {
+  const chosen = selectedLora();
+  if (!chosen) throw new Error("Choose a LoRA first");
+  const { entry, file } = chosen;
+  notice("");
+  await ensureComfy(modelFolders(entry.family, entry.paths));
+  let script = null;
+  if (supportsWorkflow(entry.family)) {
+    const objectInfo = {};
+    for (const node of new Set(NEEDS[entry.family].map(([name]) => name))) {
+      const answer = await invoke("comfy_http", { method: "GET", path: "/object_info/" + node, body: null });
+      if (answer.status !== 200) throw new Error("ComfyUI answered " + answer.status + " for " + node);
+      Object.assign(objectInfo, answer.body);
+    }
+    const strength = Number(byId("comfy-strength").value);
+    const { workflow, missing } = buildTrialWorkflow({
+      family: entry.family, objectInfo, files: entry.paths, lora: { name: entry.name, subfolder: entry.subfolder, file },
+      prompt: byId("comfy-prompt").value.trim() || trialPrompt(entry.trigger), strength: Number.isFinite(strength) ? strength : 0.8
+    });
+    if (!workflow) throw new Error("ComfyUI does not list " + missing.join(", ") + ". If ComfyUI was already running before, stop it and press the button again, or add the folder to its extra_model_paths.yaml.");
+    script = loaderScript(workflow, entry.name + " test");
+  } else {
+    notice("No ready-made workflow for this model type yet: ComfyUI opens with your LoRA in the LoRA list.");
+  }
+  await invoke("open_comfy_window", { script });
+}
+byId("comfy-try").addEventListener("click", () => withComfyButtons(tryInComfy));
+byId("train-try-comfy").addEventListener("click", () => {
+  const tab = pageTabs.find((item) => item.dataset.page === "comfy");
+  if (tab) selectPage(tab);
+  withComfyButtons(tryInComfy);
+});
+renderLoraChoices(0);
+refreshComfy().catch((error) => { byId("comfy-where").textContent = "Unavailable"; byId("comfy-config-error").hidden = false; byId("comfy-config-error").textContent = String(error?.message ?? error); });
 
 const PRESET_KEY = "costume-training-presets";
 const LEGACY_PROFILE_KEY = "costume-training-profile";
@@ -474,6 +628,8 @@ function handleEvent(event) {
   updateJobUi(data);
   learnFromTrainingEvent(data);
   if (data.type === "downloaded") onDownloaded(data);
+  if (data.type === "published") onPublished(data);
+  if (data.type === "comfy_installed") refreshComfy().catch(notice);
   toolEditor.handleEvent(event).catch(notice);
   if (data.message && !isTqdmLine(data.message)) log(data.level === "error" ? "[ERROR] " + data.message : data.message);
   if (jobKind === "mask" && data.preview_mask) showLiveMask(data.preview_source, data.preview_mask).catch(notice);
@@ -669,7 +825,8 @@ async function startTraining(kind) {
     for (const key of Object.keys(payload)) if (payload[key] === "") delete payload[key]; // optional empty fields use the backend defaults
     const skipped = excludedSources();
     if (skipped.length) payload.excluded_sources = skipped;
-    lastRun = { batchSize: payload.batch_size, resolution: payload.resolution };
+    lastRun = { batchSize: payload.batch_size, resolution: payload.resolution, family: currentFamily().id, files: currentPaths(), trigger: project.trigger_word };
+    byId("train-try-comfy").hidden = true;
     await run(kind, payload);
   } catch (error) { notice(error); }
 }

@@ -20,6 +20,7 @@ import tomllib
 
 import dataset_generator as generator
 import model_download
+import comfy_setup
 
 
 def emit(message: str, **details) -> None:
@@ -752,6 +753,15 @@ def train(payload: dict, check_only=False) -> None:
     if not (output / (payload["output_name"].strip() + ".safetensors")).is_file():
         raise RuntimeError("The training process ended but the final LoRA file was not found")
     emit(f"LoRA saved: {output}")
+    lora_root = str(payload.get("lora_output_dir") or "").strip()
+    if lora_root:
+        try:
+            published = comfy_setup.publish_lora(output, payload["output_name"].strip(), lora_root)
+        except (OSError, ValueError) as error:
+            emit(f"Warning: could not copy the LoRA to {lora_root}: {error}")
+        else:
+            emit(f"LoRA copied for ComfyUI: {published['lora_dir']} ({len(published['files'])} files)", type="published",
+                 name=payload["output_name"].strip(), family=plan["family"], **published)
 
 
 def main(argv=None) -> int:
@@ -777,6 +787,8 @@ def main(argv=None) -> int:
         elif kind == "dataset":
             result = create_dataset(payload)
             emit(f"Dataset saved: {result}", output=str(result))
+        elif kind == "comfy_install":
+            comfy_setup.install_comfyui(payload, emit)
         elif kind == "download":
             args.request.unlink(missing_ok=True)  # the request carries access tokens: do not leave it on disk
             model_download.download_items(payload, emit)

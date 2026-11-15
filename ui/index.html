@@ -17,6 +17,7 @@
       <button id="tab-dataset" data-page="dataset" role="tab" aria-selected="false" aria-controls="page-dataset" tabindex="-1"><span>Dataset Preparation</span><small>Dataset</small></button>
       <button id="tab-tools" data-page="tools" role="tab" aria-selected="false" aria-controls="page-tools" tabindex="-1"><span>Tools</span><small>Caption & Paint</small></button>
       <button id="tab-mask" data-page="mask" role="tab" aria-selected="false" aria-controls="page-mask" tabindex="-1"><span>Mask Creation</span><small>Clothing masks</small></button>
+      <button id="tab-comfy" data-page="comfy" role="tab" aria-selected="false" aria-controls="page-comfy" tabindex="-1"><span>ComfyUI</span><small>Generate</small></button>
       <button id="tab-settings" data-page="settings" role="tab" aria-selected="false" aria-controls="page-settings" tabindex="-1"><span>Environment</span><small>Settings</small></button>
     </nav>
   </header>
@@ -118,7 +119,7 @@
           <p id="summary-formula" class="help"></p>
           <p id="summary-note" class="help" role="status" aria-live="polite"></p>
         </section>
-        <div class="training-actions"><div><strong id="training-mode-label">SD1.5 · Masked LoRA</strong><p>Run the pre-flight check first to verify files, masks and CUDA.</p></div><div class="actions"><button id="validate-training" type="button" class="secondary job-action">Check environment</button><button type="submit" class="primary job-action">Start training</button></div></div>
+        <div class="training-actions"><div><strong id="training-mode-label">SD1.5 · Masked LoRA</strong><p>Run the pre-flight check first to verify files, masks and CUDA.</p></div><div class="actions"><button id="train-try-comfy" type="button" class="secondary" hidden>Try in ComfyUI</button><button id="validate-training" type="button" class="secondary job-action">Check environment</button><button type="submit" class="primary job-action">Start training</button></div></div>
       </form>
     </section>
     <section id="page-dataset" class="page" role="tabpanel" aria-labelledby="tab-dataset" hidden>
@@ -171,6 +172,28 @@
         <div id="tools-check-tags" class="check-list tag-table"></div>
       </section>
       <dialog id="tools-unsaved-dialog"><h3>You have unsaved edits</h3><p>Continuing may replace edits to masks or captions that have not been saved.</p><div class="actions"><button id="tools-discard-cancel" type="button">Back to editing</button><button id="tools-discard-confirm" type="button" class="primary">Continue without saving</button></div></dialog>
+    </section>
+    <section id="page-comfy" class="page" role="tabpanel" aria-labelledby="tab-comfy" hidden>
+      <div class="page-heading"><h2>ComfyUI <span>Generate with your LoRA</span></h2><p>Start ComfyUI and try the LoRA you trained. ComfyUI opens in its own window, next to this one.</p></div>
+      <div class="panel form-panel comfy-panel">
+        <h3 class="subsection-title">Connection</h3>
+        <dl class="comfy-facts">
+          <div><dt>ComfyUI</dt><dd id="comfy-where">—</dd></div>
+          <div><dt>Status</dt><dd id="comfy-state" role="status">—</dd></div>
+          <div><dt>LoRA folder</dt><dd id="comfy-lora-dir">—</dd></div>
+          <div><dt>Settings file</dt><dd id="comfy-source">—</dd></div>
+        </dl>
+        <p id="comfy-config-error" class="comfy-error" role="alert" hidden></p>
+        <div class="actions comfy-actions"><button type="button" id="comfy-open" class="primary">Open ComfyUI</button><button type="button" id="comfy-stop" class="secondary">Stop ComfyUI</button><button type="button" id="comfy-install" class="secondary job-action" hidden>Install ComfyUI</button></div>
+        <p class="help">Put a <code>settings.yaml</code> in the app folder to choose the LoRA folder and your own ComfyUI (WSL or Windows) — see <code>settings.example.yaml</code>. Without one, LoRAs go to G:/sd/sharedModels/loras and “Install ComfyUI” sets up a ComfyUI for this app.</p>
+      </div>
+      <div class="panel form-panel comfy-panel">
+        <h3 class="subsection-title">Try a LoRA</h3>
+        <div class="grid two-columns"><div><label for="comfy-lora">LoRA <span>trained in this app</span></label><select id="comfy-lora"></select></div><div><label for="comfy-strength">LoRA strength</label><input id="comfy-strength" type="number" min="0" max="2" step="0.05" value="0.8"></div></div>
+        <label for="comfy-prompt">Prompt <span>starts with the trigger word</span></label><textarea id="comfy-prompt" rows="3"></textarea>
+        <p id="comfy-lora-info" class="help"></p>
+        <div class="actions comfy-actions"><button type="button" id="comfy-try" class="primary">Try in ComfyUI</button></div>
+      </div>
     </section>
     <section id="page-settings" class="page" role="tabpanel" aria-labelledby="tab-settings" hidden>
       <div class="page-heading"><h2>Environment <span>Environment</span></h2><p>Set local paths for Python, the training engine and models.</p></div>

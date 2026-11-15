@@ -18,3 +18,4 @@ vendor/
 .pnpm-store/
 .training-env/
 dist/
+settings.yaml

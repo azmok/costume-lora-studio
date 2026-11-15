@@ -58,6 +58,11 @@ if not exist ".venv\Lib\site-packages\torch" (
   uv sync --python 3.12 --extra inference || echo [WARN] uv sync failed. The app opens, but AI caption/mask needs it.
 )
 
+if not exist ".training-env\.venv\Scripts\python.exe" (
+  echo [setup] Training environment - sd-scripts, PyTorch and tokenizer, first time only...
+  uv run --no-project --python 3.12 scripts\bootstrap_training.py || echo [WARN] Training setup failed. See the messages above, then run start.cmd again.
+)
+
 echo [start] Launching Costume LoRA Studio...
 call pnpm dev
 if errorlevel 1 goto :fail_dev
