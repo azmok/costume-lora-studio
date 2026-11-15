@@ -1,9 +1,11 @@
+import { BUILTIN_PRESETS, DEFAULT_PARAMS, OPTIMIZERS, PARAM_FIELDS, PARAM_SCHEMA, SCHEDULERS, builtinPreset, optimizerInfo, parseSpeed, summaryModel, updateSpeed } from "./training-params.mjs";
 import { PROJECT_DEFAULTS, TRAINING_DEFAULTS, required, validateTraining, applyJobEvent, makeTrainingProfile, readTrainingProfile, normalizePresetName, readPresetStore, upsertPreset, removePreset, serializePresetStore } from "./state.mjs";
 import { createTools } from "./tools.js";
 import { createImageZoom } from "./image-zoom.mjs";
 import { createFullscreen } from "./fullscreen.mjs";
 import { SHORTCUT_SECTIONS } from "./shortcuts.mjs";
-import { isTqdmLine, newJobUi, progressModel, reduceJobUi } from "./job-progress.mjs";
+import { getRecord, loadSelectionStore, rootKey, selectionSummary } from "./training-selection.mjs";
+import { isTqdmLine, newJobUi, parseTqdm, progressModel, reduceJobUi } from "./job-progress.mjs";
 import { PROJECTS_KEY, createProject, deleteProject, newStore, readStore, renameProject, setActive, updateProjectData } from "./projects.mjs";
 import { getMaskColor, hexToRgb, setMaskColor } from "./mask-color.mjs";
 import { readPageZoom, stepPageZoom } from "./page-zoom.mjs";
@@ -39,6 +41,8 @@ try {
 }
 let job = { jobId: null, status: "idle" };
 let jobKind = "";
+let summaryReady = false; // the training summary needs everything below to be set up
+let lastRun = null; // batch size and resolution of the training run in progress, for learning its speed
 let entries = [];
 const liveMasks = new Map();
 let followLive = true;
@@ -84,6 +88,7 @@ function selectPage(button) {
   byId("breadcrumb").textContent = button.querySelector("span").textContent;
   currentPage = page;
   scheduleProjectSave();
+  updateSelectionSummary();
   notice("");
   window.scrollTo(0, 0);
 }
@@ -112,15 +117,50 @@ document.querySelectorAll("[data-section]").forEach((button) => {
   });
 });
 
-const trainingFields = {
-  steps: "steps", batch_size: "batch-size", rank: "rank", alpha: "alpha",
-  learning_rate: "learning-rate", seed: "seed", mixed_precision: "mixed-precision"
-};
+const trainingFields = PARAM_FIELDS;
+const flagKeys = new Set(PARAM_SCHEMA.filter((item) => item.kind === "flag").map((item) => item.key));
+function setupParameterControls() {
+  const fill = (id, items) => byId(id).replaceChildren(...items.map(([value, label]) => { const option = document.createElement("option"); option.value = String(value); option.textContent = label; return option; }));
+  fill("train-resolution", PARAM_SCHEMA.find((item) => item.key === "resolution").options.map((value) => [value, value + " × " + value]));
+  fill("optimizer", OPTIMIZERS.map((item) => [item.value, item.label]));
+  fill("scheduler", SCHEDULERS.map((item) => [item.value, item.label]));
+  for (const item of PARAM_SCHEMA) {
+    if (item.kind !== "number") continue;
+    const input = byId(item.id);
+    input.min = String(item.min);
+    input.max = String(item.max);
+    input.step = item.integer ? "1" : "any";
+    input.required = true;
+  }
+}
+setupParameterControls();
 function trainingValues() {
-  return Object.fromEntries(Object.entries(trainingFields).map(([key, id]) => [key, byId(id).value]));
+  return Object.fromEntries(Object.entries(trainingFields).map(([key, id]) => [key, flagKeys.has(key) ? byId(id).checked : byId(id).value]));
 }
 function applyTrainingValues(values) {
-  for (const [key, id] of Object.entries(trainingFields)) byId(id).value = values[key];
+  for (const [key, id] of Object.entries(trainingFields)) {
+    const value = values[key] ?? DEFAULT_PARAMS[key];
+    if (flagKeys.has(key)) byId(id).checked = value === true || value === "true"; else byId(id).value = String(value);
+  }
+  syncParameterDependencies();
+  updateTrainingSummary();
+}
+// Controls that only matter for some choices are switched off for the others.
+function syncParameterDependencies() {
+  const alpha = byId("alpha-mask").checked;
+  byId("use-masks").disabled = alpha;
+  const masks = byId("use-masks").checked && !alpha;
+  byId("train-masks").required = masks;
+  byId("training-mode-label").textContent = alpha ? "SD1.5 · Alpha mask LoRA" : masks ? "SD1.5 · Masked LoRA" : "SD1.5 · LoRA (no masks)";
+  byId("lr-cycles").disabled = byId("scheduler").value !== "cosine_with_restarts";
+  byId("keep-tokens").disabled = !byId("shuffle-caption").checked;
+  const info = optimizerInfo(byId("optimizer").value);
+  const adaptive = ["Prodigy", "DAdaptAdam", "DAdaptation"].includes(byId("optimizer").value);
+  const lr = Number(byId("learning-rate").value);
+  const parts = [];
+  if (info?.package) parts.push("Needs the Python package “" + info.package + "” in the training Python (pip install " + info.pip + "). “Check environment” tells you if it is missing.");
+  if (adaptive && lr > 0 && lr < 0.1) parts.push("This optimizer adapts the learning rate by itself: set Learning rate to 1.");
+  byId("optimizer-hint").textContent = parts.join(" ");
 }
 const PRESET_KEY = "costume-training-presets";
 const LEGACY_PROFILE_KEY = "costume-training-profile";
@@ -138,6 +178,21 @@ let presets = loadPresets();
 function persistPresets() {
   localStorage.setItem(PRESET_KEY, serializePresetStore(presets));
 }
+const BUILTIN_PREFIX = "builtin:";
+function renderBuiltinGroups() {
+  const select = byId("training-profile");
+  const anchor = byId("custom-presets");
+  const groups = new Map();
+  for (const item of BUILTIN_PRESETS) {
+    if (!groups.has(item.group)) { const group = document.createElement("optgroup"); group.label = item.group; groups.set(item.group, group); }
+    const option = document.createElement("option");
+    option.value = BUILTIN_PREFIX + item.id;
+    option.textContent = item.name;
+    groups.get(item.group).append(option);
+  }
+  for (const group of groups.values()) select.insertBefore(group, anchor);
+}
+renderBuiltinGroups();
 function renderPresets(selectedName) {
   const group = byId("custom-presets");
   group.replaceChildren(...presets.map((preset) => {
@@ -155,14 +210,25 @@ function selectedPreset() {
   const value = byId("training-profile").value;
   return value.startsWith("custom:") ? presets.find((preset) => preset.name === value.slice(7)) : null;
 }
+function selectedBuiltin() {
+  const value = byId("training-profile").value;
+  return value.startsWith(BUILTIN_PREFIX) ? builtinPreset(value.slice(BUILTIN_PREFIX.length)) : null;
+}
 function syncPresetControls() {
   byId("delete-profile").disabled = !selectedPreset();
+  byId("preset-description").textContent = selectedBuiltin()?.description ?? "";
+}
+function applyBuiltin(item) {
+  applyTrainingValues(item.parameters);
+  byId("profile-status").textContent = "Applied “" + item.name + "”. Folder paths are unchanged — adjust any value below.";
 }
 renderPresets();
 byId("training-profile").addEventListener("change", () => {
   const preset = selectedPreset();
+  const builtin = selectedBuiltin();
   byId("preset-name").value = preset ? preset.name : "";
   syncPresetControls();
+  if (builtin) { applyBuiltin(builtin); notice(""); } // built-in presets apply as soon as they are picked
 });
 byId("save-profile").addEventListener("click", () => {
   try {
@@ -179,7 +245,10 @@ byId("save-profile").addEventListener("click", () => {
 byId("load-profile").addEventListener("click", () => {
   try {
     const preset = selectedPreset();
-    if (!preset) {
+    const builtin = selectedBuiltin();
+    if (builtin) {
+      applyBuiltin(builtin);
+    } else if (!preset) {
       applyTrainingValues(TRAINING_DEFAULTS);
       byId("profile-status").textContent = "Parameters reset to defaults. Folder paths are unchanged.";
     } else {
@@ -282,6 +351,7 @@ function handleEvent(event) {
   const data = event.data;
   if (!jobUi && job.status === "running") startJobUi(jobKind); // e.g. the app was reopened while a job runs
   updateJobUi(data);
+  learnFromTrainingEvent(data);
   toolEditor.handleEvent(event).catch(notice);
   if (data.message && !isTqdmLine(data.message)) log(data.level === "error" ? "[ERROR] " + data.message : data.message);
   if (jobKind === "mask" && data.preview_mask) showLiveMask(data.preview_source, data.preview_mask).catch(notice);
@@ -339,12 +409,16 @@ byId("mask-form").addEventListener("submit", async (event) => {
   } catch (error) { notice(error); }
 });
 
+byId("dataset-transparent").addEventListener("change", () => {
+  byId("dataset-masks").required = !byId("dataset-transparent").checked;
+});
 byId("dataset-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
     await run("dataset", {
       input_dir: required(project.raw_dir, "Source images folder"),
-      mask_dir: required(project.mask_dir, "Mask folder"),
+      transparent: byId("dataset-transparent").checked,
+      mask_dir: byId("dataset-transparent").checked ? "" : required(project.mask_dir, "Mask folder"),
       output_dir: required(project.dataset_dir, "Dataset output"),
       trigger_word: required(project.trigger_word, "Trigger word"),
       caption_mode: byId("caption-mode").value, max_resolution: Number(byId("resolution").value),
@@ -353,6 +427,94 @@ byId("dataset-form").addEventListener("submit", async (event) => {
     });
   } catch (error) { notice(error); }
 });
+
+// Images unchecked in Tools are left out of training when "Use only the images selected in Tools" is on.
+function excludedSources() {
+  return byId("use-tools-selection").checked ? getRecord(loadSelectionStore(), project.raw_dir).excluded : [];
+}
+function updateSelectionSummary() {
+  byId("tools-selection-summary").textContent = selectionSummary(getRecord(loadSelectionStore(), project.raw_dir), byId("use-tools-selection").checked);
+  updateTrainingSummary();
+}
+byId("use-tools-selection").addEventListener("change", updateSelectionSummary);
+window.addEventListener("training-selection-change", updateSelectionSummary);
+
+// ---- total steps / repeats / time estimate at the bottom of the Training tab ----
+const IMAGES_KEY = "costume-train-images";
+const SPEED_KEY = "costume-train-speed";
+function readImageCache() {
+  try { const data = JSON.parse(localStorage.getItem(IMAGES_KEY) || "{}"); return data && typeof data === "object" && !Array.isArray(data) ? data : {}; } catch { return {}; }
+}
+function rememberImageCount(count) {
+  const key = rootKey(project.dataset_dir);
+  if (!key || !(count > 0)) return;
+  try { localStorage.setItem(IMAGES_KEY, JSON.stringify({ ...readImageCache(), [key]: count })); } catch { /* storage unavailable */ }
+  updateTrainingSummary();
+}
+function trainingImages() {
+  const record = getRecord(loadSelectionStore(), project.raw_dir);
+  if (record.total > 0) {
+    const count = byId("use-tools-selection").checked ? Math.max(0, record.total - record.excluded.length) : record.total;
+    return { count, source: "the images in Tools" };
+  }
+  const cached = Number(readImageCache()[rootKey(project.dataset_dir)]);
+  return cached > 0 ? { count: cached, source: "your last environment check" } : null;
+}
+function loadSpeed() {
+  try { return parseSpeed(localStorage.getItem(SPEED_KEY)); } catch { return null; }
+}
+function formField(key) {
+  const text = byId(trainingFields[key]).value.trim();
+  const value = Number(text);
+  return text !== "" && Number.isFinite(value) && value > 0 ? value : DEFAULT_PARAMS[key];
+}
+function updateTrainingSummary() {
+  if (!summaryReady) return;
+  const values = { ...DEFAULT_PARAMS, resolution: formField("resolution"), batch_size: formField("batch_size"), repeats: formField("repeats"), epochs: formField("epochs") };
+  const limit = Number(byId("steps").value);
+  values.steps = Number.isFinite(limit) && limit > 0 ? limit : 0;
+  const images = trainingImages();
+  const model = summaryModel(values, images, loadSpeed());
+  const set = (id, text) => { byId(id).textContent = text; };
+  set("sum-images", images ? String(images.count) : "—");
+  set("sum-repeats", String(values.repeats));
+  set("sum-epochs", model.ready && model.totals.byMaxSteps ? "≈ " + Number(model.totals.epochs.toFixed(1)) : String(values.epochs));
+  set("sum-batch", String(values.batch_size));
+  if (!model.ready) {
+    for (const id of ["sum-spe", "sum-total", "sum-time"]) set(id, "—");
+    set("summary-formula", "");
+    set("summary-note", images && images.count === 0
+      ? "Every image is unchecked in Tools — nothing would be trained."
+      : "The image count is not known yet. Load your source folder in Tools, or press “Check environment” once, and the totals appear here.");
+    return;
+  }
+  const totals = model.totals;
+  const number = (value) => value.toLocaleString("en-US");
+  set("sum-spe", number(totals.stepsPerEpoch));
+  set("sum-total", number(totals.totalSteps));
+  set("sum-time", model.estimate);
+  set("summary-formula", totals.byMaxSteps
+    ? "Max train steps is set, so training stops at " + number(totals.totalSteps) + " steps (" + number(totals.stepsPerEpoch) + " steps per epoch × about " + Number(totals.epochs.toFixed(1)) + " epochs)."
+    : images.count + " images × " + values.repeats + " repeats ÷ batch " + values.batch_size + " = " + number(totals.stepsPerEpoch) + " steps per epoch × " + values.epochs + " epochs = " + number(totals.totalSteps) + " steps.");
+  set("summary-note", "Time estimate: " + model.speedNote + ". Image count comes from " + images.source + ".");
+}
+document.getElementById("parameters-section").addEventListener("input", () => { syncParameterDependencies(); updateTrainingSummary(); });
+document.getElementById("parameters-section").addEventListener("change", () => { syncParameterDependencies(); updateTrainingSummary(); });
+document.querySelectorAll("[data-project=dataset_dir], [data-project=raw_dir]").forEach((input) => input.addEventListener("input", updateTrainingSummary));
+
+// The pre-flight check reports how many images will really be used; the training progress bar tells the speed.
+function learnFromTrainingEvent(data) {
+  if (jobKind !== "train" && jobKind !== "validate") return;
+  if (data.type === "validated" && data.samples > 0) rememberImageCount(data.samples);
+  if (jobKind !== "train" || !lastRun || !data.message) return;
+  const bar = parseTqdm(data.message);
+  if (!bar || !/^steps/i.test(bar.label) || bar.percent < 2 || !bar.rate) return;
+  const next = updateSpeed(loadSpeed(), { rateText: bar.rate, batchSize: lastRun.batchSize, resolution: lastRun.resolution });
+  if (next) { try { localStorage.setItem(SPEED_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ } updateTrainingSummary(); }
+}
+applyTrainingValues(TRAINING_DEFAULTS); // the form starts with the default parameters
+summaryReady = true;
+updateTrainingSummary();
 
 async function startTraining(kind) {
   const form = byId("train-form");
@@ -366,17 +528,20 @@ async function startTraining(kind) {
   }
   if (!form.reportValidity()) return;
   try {
-    await run(kind, validateTraining({
+    const values = trainingValues();
+    const payload = validateTraining({
+      ...values,
       checkpoint: required(project.checkpoint, "SD1.5 model"),
       dataset_dir: required(project.dataset_dir, "Dataset"),
-      mask_dir: required(project.train_masks, "Training masks"),
+      mask_dir: values.use_masks && !values.alpha_mask ? required(project.train_masks, "Training masks") : "",
       output_dir: required(project.training_dir, "LoRA output"),
-      output_name: required(project.output_name, "LoRA name"),
-      steps: byId("steps").value, batch_size: byId("batch-size").value,
-      rank: byId("rank").value, alpha: byId("alpha").value,
-      learning_rate: byId("learning-rate").value, seed: byId("seed").value,
-      mixed_precision: byId("mixed-precision").value, resolution: 512
-    }));
+      output_name: required(project.output_name, "LoRA name")
+    });
+    for (const key of Object.keys(payload)) if (payload[key] === "") delete payload[key]; // optional empty fields use the backend defaults
+    const skipped = excludedSources();
+    if (skipped.length) payload.excluded_sources = skipped;
+    lastRun = { batchSize: payload.batch_size, resolution: payload.resolution };
+    await run(kind, payload);
   } catch (error) { notice(error); }
 }
 
@@ -785,6 +950,7 @@ async function openProject(afterSwitch) {
   await toolEditor.prepareForProjectChange();
   afterSwitch();
   applyProjectData(activeProject().data);
+  updateSelectionSummary();
   resetPreview();
   toolEditor.resetForProject();
   if (native) toolEditor.autoLoad();
@@ -852,6 +1018,7 @@ projectStore = readStore(localStorage.getItem(PROJECTS_KEY));
 if (projectStore) applyProjectData(activeProject().data);
 else { projectStore = newStore("My project", collectProjectData()); persistProjects(); }
 renderProjectSelect();
+updateSelectionSummary();
 showProjectStatus("Autosave on");
 if (native) toolEditor.autoLoad();
 

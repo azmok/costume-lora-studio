@@ -18,7 +18,7 @@ export const SHORTCUT_SECTIONS = [
     items: [
       ["Q", "Toggle the mask overlay (Overlay ↔ Original)"], ["Shift + Q", "Cycle Original / Overlay / Mask / Split"],
       ["F", "Full screen"], ["Esc", "Exit full screen"], ["Tab (full screen)", "Hide / show the floating toolbox"],
-      ["PageUp  PageDown", "Previous / next image"], ["N", "Next unreviewed image"], ["R", "Mark reviewed"],
+      ["PageUp  PageDown", "Previous / next image"], ["N", "Next unreviewed image"], ["R", "Mark reviewed"], ["T", "Use / skip this image for LoRA training"],
       ["Ctrl + S", "Save all changes"]
     ]
   },

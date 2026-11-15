@@ -88,6 +88,15 @@ details[open] > summary { border-bottom: 1px solid var(--border); }
 .primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; min-height: 44px; }
 .primary:hover { background: #fdba74; border-color: #fdba74; }
 .secondary { background: #202b3f; }
+.preset-description { color: #cbd4e3; min-height: 1.8em; }
+.option-checks { margin-top: 4px; }
+.training-summary { background: #182234; border: 1px solid #4b566c; border-radius: 8px; padding: 14px 19px 12px; margin-top: 20px; }
+.training-summary .subsection-title { margin-top: 0; }
+.summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px 16px; margin: 0; }
+.summary-grid dt { font-size: 11px; color: var(--muted); }
+.summary-grid dd { margin: 2px 0 0; font-size: 18px; font-weight: 600; color: #e6ecf7; font-variant-numeric: tabular-nums; }
+.summary-grid .summary-time dd { color: #ffb26c; }
+.training-summary .help { margin-top: 8px; }
 .training-actions { display: flex; align-items: center; justify-content: space-between; gap: 18px; background: #182234; border: 1px solid #4b566c; border-radius: 8px; padding: 16px 19px; margin-top: 20px; }
 .training-actions strong { font-size: 13px; }
 .training-actions p { font-size: 11px; margin-top: 4px; }
@@ -353,6 +362,18 @@ kbd { display: inline-block; padding: 0 5px; border: 1px solid var(--border); bo
 #tools-caption-main .tool-action-row button { flex: 1; }
 .job-bar { z-index: 110; }
 #tools-canvas.pixelated, .preview-stage canvas.pixelated { image-rendering: pixelated; }
+/* images used for LoRA training */
+.tool-image-row { display: flex; align-items: center; gap: 6px; margin-bottom: 5px; }
+.tool-image-row .tool-image-item { flex: 1; min-width: 0; margin-bottom: 0; }
+.train-check { width: 18px; min-width: 18px; height: 18px; min-height: 0; padding: 0; flex: none; accent-color: var(--accent); cursor: pointer; }
+.tool-image-row.excluded .tool-image-item { opacity: .45; }
+.tool-image-row.excluded .tool-image-item > span:last-child { text-decoration: line-through; }
+.train-select-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; padding: 0 8px 8px; font-size: 11px; color: #aab6cc; }
+.train-select-bar button { padding: 3px 7px; min-height: 24px; font-size: 11px; }
+.selection-box { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: #0e1626; }
+.selection-box .help { margin: 6px 0 0; }
+.autosave-toggle { margin: 0; font-size: 11px; white-space: nowrap; }
+#tools-autosave-status { font-size: 10px; max-width: 200px; overflow-wrap: anywhere; }
 .zoom-controls { display: flex; align-items: center; gap: 4px; }
 .zoom-controls button { min-height: 34px; min-width: 34px; padding: 0 8px; }
 .tool-editor-panel .panel-header { gap: 10px; }

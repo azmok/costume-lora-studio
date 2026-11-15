@@ -270,6 +270,90 @@ class WorkflowTests(unittest.TestCase):
             "output_name": "costume",
         }
 
+    def add_dataset_image(self, payload, name):
+        """Copy the single prepared image into extra records so selections can be tested."""
+        import shutil
+
+        dataset = Path(payload["dataset_dir"])
+        metadata_path = dataset / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        first = metadata["images"][0]
+        relative = Path(first["image"]).relative_to("images")
+        for folder, suffixes in (("images", (".png", ".txt")), ("masks", (".png",))):
+            for suffix in suffixes:
+                shutil.copy2(dataset / folder / relative.with_suffix(suffix), dataset / folder / (name + suffix))
+        metadata["images"].append({**first, "source": name + ".png", "image": "images/" + name + ".png", "mask": "masks/" + name + ".png"})
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    def prepared_relative(self, payload):
+        """Path of the first prepared image under images/ (datasets group files into hash-named folders)."""
+        metadata = json.loads((Path(payload["dataset_dir"]) / "metadata.json").read_text(encoding="utf-8"))
+        return Path(metadata["images"][0]["image"]).relative_to("images")
+
+    @staticmethod
+    def files_under(folder):
+        return sorted(path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file())
+
+    def test_unchecked_images_are_left_out_and_only_the_rest_is_linked_for_training(self):
+        payload = self.training_payload()
+        first = self.prepared_relative(payload)
+        self.add_dataset_image(payload, "second")
+        self.add_dataset_image(payload, "third")
+        everything = desktop.training_plan(payload)
+        self.assertEqual((everything["samples"], everything["left_out"], everything["selection"]), (3, 0, None))
+        payload["excluded_sources"] = ["SECOND.png"]  # matched ignoring case
+        plan = desktop.training_plan(payload)
+        self.assertEqual((plan["samples"], plan["left_out"]), (2, 1))
+        root = plan["selection"]["root"]
+        subsets = tomllib.loads(plan["dataset_toml"])["datasets"][0]["subsets"]
+        self.assertTrue(all(Path(item["image_dir"]).is_relative_to(root / "images") for item in subsets))
+        self.assertTrue(all(Path(item["conditioning_data_dir"]).is_relative_to(root / "masks") for item in subsets))
+        self.assertFalse(plan["output"].exists())  # planning never writes
+        desktop.materialize_selection(plan["selection"])
+        self.assertEqual(self.files_under(root / "images"), sorted([first.as_posix(), first.with_suffix(".txt").as_posix(), "third.png", "third.txt"]))
+        self.assertEqual(self.files_under(root / "masks"), sorted([first.as_posix(), "third.png"]))
+        self.assertTrue((Path(payload["dataset_dir"]) / "images" / "second.png").is_file())  # the dataset is untouched
+
+    def test_training_start_builds_the_selection_folder_and_reports_it(self):
+        payload = self.training_payload()
+        first = self.prepared_relative(payload)
+        self.add_dataset_image(payload, "second")
+        payload["excluded_sources"] = ["second.png"]
+        torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+        seen = {}
+
+        def training_stub(command, **kwargs):
+            config = tomllib.loads(Path(command[-1]).read_text(encoding="utf-8"))
+            dataset_toml = tomllib.loads(Path(config["dataset_config"]).read_text(encoding="utf-8"))
+            seen["files"] = sorted(path.name for item in dataset_toml["datasets"][0]["subsets"] for path in Path(item["image_dir"]).rglob("*") if path.is_file())
+            Path(payload["output_dir"], payload["output_name"] + ".safetensors").touch()
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict("sys.modules", {"torch": torch_stub, "transformers": SimpleNamespace(CLIPTokenizer=Mock())}):
+            with patch("desktop_backend.subprocess.run", side_effect=training_stub), patch("desktop_backend.emit") as emitted:
+                desktop.train(payload)
+        self.assertEqual(seen["files"], sorted([first.name, first.with_suffix(".txt").name]))  # the unchecked image never reaches the trainer
+        self.assertTrue(any("using 1 of 2 images" in call.args[0] for call in emitted.call_args_list))
+
+    def test_selecting_no_image_or_a_malformed_list_is_rejected(self):
+        payload = self.training_payload()
+        payload["excluded_sources"] = ["sample.png"]
+        with self.assertRaisesRegex(ValueError, "No images are selected"):
+            desktop.training_plan(payload)
+        for bad in ("sample.png", [1, 2], {"a": 1}):
+            payload["excluded_sources"] = bad
+            with self.assertRaisesRegex(ValueError, "excluded_sources"):
+                desktop.training_plan(payload)
+
+    def test_a_selected_image_without_a_mask_is_named_in_the_error_but_an_unchecked_one_is_not(self):
+        payload = self.training_payload()
+        self.add_dataset_image(payload, "second")
+        (Path(payload["mask_dir"]) / "second.png").unlink()
+        with self.assertRaisesRegex(ValueError, "No mask for second.png"):
+            desktop.training_plan(payload)
+        payload["excluded_sources"] = ["second.png"]
+        self.assertEqual(desktop.training_plan(payload)["samples"], 1)
+
     def test_separate_masks_reused_without_loading_sam(self):
         dataset = self.make_dataset()
         metadata = json.loads((dataset / "metadata.json").read_text())
@@ -343,11 +427,95 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(tomllib.loads(plan["dataset_toml"])["datasets"][0]["subsets"][0]["conditioning_data_dir"],
                          str(Path(payload["mask_dir"]) / Path(json.loads((Path(payload["dataset_dir"]) / "metadata.json").read_text())["images"][0]["image"]).relative_to("images").parent).replace("\\", "/"))
 
+    def test_new_training_parameters_reach_the_trainer_config(self):
+        payload = self.training_payload()
+        legacy = tomllib.loads(desktop.training_plan(payload)["training_toml"])
+        self.assertEqual((legacy["optimizer_type"], legacy["lr_scheduler"], legacy["max_train_steps"]), ("AdamW", "constant", 1000))
+        self.assertNotIn("max_train_epochs", legacy)
+        self.assertEqual(tomllib.loads(desktop.training_plan(payload)["dataset_toml"])["datasets"][0]["subsets"][0]["num_repeats"], 1)
+        self.add_dataset_image(payload, "second")
+        payload.update({
+            "repeats": 8, "epochs": 10, "steps": 0, "batch_size": 2, "optimizer": "AdamW8bit", "optimizer_args": "weight_decay=0.01 betas=(0.9,0.99)",
+            "learning_rate": 0.0001, "text_encoder_lr": 0.00005, "lr_scheduler": "cosine_with_restarts", "lr_warmup_percent": 5,
+            "lr_scheduler_num_cycles": 3, "rank": 32, "alpha": 16, "min_snr_gamma": 5, "noise_offset": 0.05, "clip_skip": 2,
+            "shuffle_caption": True, "keep_tokens": 1, "gradient_checkpointing": False,
+        })
+        plan = desktop.training_plan(payload)
+        config = tomllib.loads(plan["training_toml"])
+        dataset = tomllib.loads(plan["dataset_toml"])
+        self.assertEqual((plan["steps_per_epoch"], plan["total_steps"]), (8, 80))  # 2 images x 8 repeats / batch 2
+        self.assertEqual(config["max_train_epochs"], 10)
+        self.assertNotIn("max_train_steps", config)
+        self.assertEqual((config["optimizer_type"], config["optimizer_args"], config["lr_scheduler"]), ("AdamW8bit", ["weight_decay=0.01", "betas=(0.9,0.99)"], "cosine_with_restarts"))
+        self.assertEqual((config["lr_warmup_steps"], config["lr_scheduler_num_cycles"], config["min_snr_gamma"], config["noise_offset"], config["clip_skip"]), (4, 3, 5, 0.05, 2))
+        self.assertEqual((config["text_encoder_lr"], config["unet_lr"], config["network_dim"], config["network_alpha"]), (0.00005, 0.0001, 32, 16))
+        self.assertNotIn("network_train_unet_only", config)
+        self.assertFalse(config["gradient_checkpointing"])
+        self.assertTrue(config["masked_loss"])
+        self.assertEqual((dataset["general"]["shuffle_caption"], dataset["general"]["keep_tokens"]), (True, 1))
+        self.assertTrue(all(item["num_repeats"] == 8 for item in dataset["datasets"][0]["subsets"]))
+        payload["steps"] = 50  # an explicit step limit wins over the epochs
+        limited = desktop.training_plan(payload)
+        self.assertEqual(limited["total_steps"], 50)
+        self.assertEqual(tomllib.loads(limited["training_toml"])["max_train_steps"], 50)
+
+    def test_training_without_masks_needs_no_mask_files(self):
+        payload = self.training_payload()
+        payload["use_masks"] = False
+        payload["mask_dir"] = str(self.root / "no-such-masks")
+        plan = desktop.training_plan(payload)
+        config = tomllib.loads(plan["training_toml"])
+        self.assertFalse(config["masked_loss"])
+        self.assertTrue(all("conditioning_data_dir" not in item for item in tomllib.loads(plan["dataset_toml"])["datasets"][0]["subsets"]))
+        payload["excluded_sources"] = []
+        self.add_dataset_image(payload, "second")
+        payload["excluded_sources"] = ["second.png"]
+        selection = desktop.training_plan(payload)
+        self.assertEqual(selection["samples"], 1)
+        desktop.materialize_selection(selection["selection"])  # no masks are linked
+        self.assertFalse((selection["selection"]["root"] / "masks").exists())
+        self.assertTrue(any((selection["selection"]["root"] / "images").rglob("*.png")))
+
+    def test_invalid_training_parameters_are_rejected_with_the_key_name(self):
+        payload = self.training_payload()
+        for patch_values, pattern in (
+            ({"optimizer": "SGD"}, "optimizer"), ({"lr_scheduler": "step"}, "lr_scheduler"), ({"repeats": 0}, "repeats"),
+            ({"epochs": 1.5}, "epochs"), ({"clip_skip": 3}, "clip_skip"), ({"use_masks": "no"}, "use_masks"),
+            ({"optimizer_args": "oops"}, "optimizer_args"), ({"alpha": 600, "rank": 512}, "alpha"), ({"batch_size": 17}, "batch_size"),
+            ({"lr_warmup_percent": 60}, "lr_warmup_percent"), ({"shuffle_caption": 1}, "shuffle_caption"),
+        ):
+            with self.subTest(patch_values):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    desktop.training_plan({**payload, **patch_values})
+
+    def test_missing_optimizer_package_is_reported_with_a_pip_hint(self):
+        self.assertIsNone(desktop.optimizer_package_problem("AdamW"))
+        with patch("desktop_backend.importlib.util.find_spec", return_value=None):
+            self.assertIn("pip install prodigyopt", desktop.optimizer_package_problem("Prodigy"))
+            self.assertIn("pip install bitsandbytes", desktop.optimizer_package_problem("AdamW8bit"))
+        payload = {**self.training_payload(), "optimizer": "Prodigy", "learning_rate": 1}
+        with patch("desktop_backend.importlib.util.find_spec", return_value=None), patch("desktop_backend.emit"):
+            with self.assertRaisesRegex(ValueError, "prodigyopt"):
+                desktop.train(payload)
+        self.assertFalse(Path(payload["output_dir"]).exists())
+
+    def test_validated_event_carries_the_counts_and_adaptive_optimizers_warn_about_the_learning_rate(self):
+        payload = {**self.training_payload(), "optimizer": "Prodigy", "learning_rate": 0.0001, "repeats": 4, "epochs": 3, "steps": 0}
+        self.assertEqual(len(desktop.training_plan(payload)["warnings"]), 1)
+        torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+        with patch.dict("sys.modules", {"torch": torch_stub, "transformers": SimpleNamespace(CLIPTokenizer=Mock())}):
+            with patch("desktop_backend.importlib.util.find_spec", return_value=object()), patch("desktop_backend.emit") as emitted:
+                with self.assertRaisesRegex(ValueError, "CUDA"):
+                    desktop.train(payload)
+        validated = next(call for call in emitted.call_args_list if call.kwargs.get("type") == "validated")
+        self.assertEqual((validated.kwargs["samples"], validated.kwargs["steps_per_epoch"], validated.kwargs["total_steps"]), (1, 4, 12))
+        self.assertTrue(any("Warning" in call.args[0] and "Learning rate" in call.args[0] for call in emitted.call_args_list))
+
     def test_training_rejects_missing_masks(self):
         payload = self.training_payload()
         mask = next(Path(payload["mask_dir"]).rglob("*.png"))
         mask.unlink()
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaisesRegex(ValueError, "No mask for"):
             desktop.training_plan(payload)
 
     def test_training_rejects_empty_captions(self):

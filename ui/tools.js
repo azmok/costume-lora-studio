@@ -5,6 +5,7 @@ import { createFullscreen } from "./fullscreen.mjs";
 import { getMaskColor, hexToRgb, setMaskColor } from "./mask-color.mjs";
 import { coverage as maskCoverage, fillHoles, growMask, invertMask, removeSpecks, shrinkMask } from "./mask-ops.mjs";
 import { ISSUE_LABELS, classify, laplacianVariance, tagFrequency, toGray } from "./dataset-check.mjs";
+import { getRecord, loadSelectionStore, saveSelectionStore, setRecord } from "./training-selection.mjs";
 import { dedupeTags, hasTag, normalizeCaption, removeTag, BUILTIN_TEMPLATES, NO_TEMPLATE, insertTags, normalizeTemplateName, readTemplateStore, removeTemplate, serializeTemplateStore, splitTags, upsertTemplate } from "./tools-captions.mjs";
 
 export function createTools({ invoke, run, notice, getProject, getJob }) {
@@ -36,6 +37,10 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   let checkInfo = new Map(); // relative -> { width, height, blur, coverage, hasMask, caption } from the dataset check
   let checkIssues = new Map(); // relative -> [issue codes]
   let lastBulk = null; // { label, before: Map(relative -> caption) } for "Undo last bulk edit"
+  let trainingStore = {}; // which images LoRA training uses, per source folder (unchecked = left out)
+  const excludedTraining = new Set();
+  let editRev = 0; // bumps on every edit, so a save in progress never clears the "unsaved" flag of newer edits
+  let autosaveTimer = 0;
   let reviewed = new Set();
   let spaceDown = false;
   let altDown = false;
@@ -65,7 +70,11 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     byId("tools-fs-info").textContent = current() ? current().relative + (maskDirty || captionDirty ? "  ●" : "") : "";
     const visible = visibleIndexes();
     const position = visible.indexOf(selected);
-    byId("tools-count").textContent = (filter ? visible.length + " of " + entries.length : entries.length) + (entries.length === 1 ? " image" : " images") + (entries.length ? " · " + reviewed.size + " reviewed" : "");
+    byId("tools-count").textContent = (filter ? visible.length + " of " + entries.length : entries.length) + (entries.length === 1 ? " image" : " images") + (entries.length ? " · " + reviewed.size + " reviewed · " + (entries.length - excludedCount()) + " for training" : "");
+    byId("tools-train-toggle").setAttribute("aria-pressed", String(Boolean(current() && !excludedTraining.has(current().relative))));
+    byId("tools-train-toggle").disabled = locked || !current();
+    for (const id of ["tools-train-all", "tools-train-none", "tools-train-invert", "tools-train-highlighted"]) byId(id).disabled = locked || entries.length === 0;
+    document.querySelectorAll(".train-check").forEach((box) => { box.disabled = locked; });
     byId("tools-reviewed").setAttribute("aria-pressed", String(Boolean(current() && reviewed.has(current().relative))));
     byId("tools-prev").disabled = locked || position <= 0;
     byId("tools-next").disabled = locked || visible.length === 0 || position >= visible.length - 1;
@@ -236,6 +245,43 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     }
   }
 
+  // ---- which images are used for LoRA training: all of them unless unchecked ----
+  const excludedCount = () => entries.filter((entry) => excludedTraining.has(entry.relative)).length;
+  function persistTrainingSelection() {
+    trainingStore = setRecord(trainingStore, loadedRoot, { excluded: [...excludedTraining], total: entries.length });
+    saveSelectionStore(trainingStore); // the Train tab reads this
+  }
+  function loadTrainingSelection() {
+    trainingStore = loadSelectionStore();
+    const present = new Set(entries.map((entry) => entry.relative));
+    excludedTraining.clear();
+    for (const name of getRecord(trainingStore, loadedRoot).excluded) if (present.has(name)) excludedTraining.add(name);
+    persistTrainingSelection();
+  }
+  function refreshTrainingMarks() {
+    for (const box of byId("tools-files").querySelectorAll(".train-check")) {
+      const used = !excludedTraining.has(box.dataset.relative);
+      box.checked = used;
+      box.closest(".tool-image-row").classList.toggle("excluded", !used);
+    }
+    updateControls();
+  }
+  function setTrainingSelection(usedNames) {
+    excludedTraining.clear();
+    for (const entry of entries) if (!usedNames.has(entry.relative)) excludedTraining.add(entry.relative);
+    persistTrainingSelection();
+    refreshTrainingMarks();
+  }
+  function setTrainingUse(relatives, used) {
+    for (const relative of relatives) { if (used) excludedTraining.delete(relative); else excludedTraining.add(relative); }
+    persistTrainingSelection();
+    refreshTrainingMarks();
+  }
+  function toggleTraining() {
+    const entry = current();
+    if (entry) setTrainingUse([entry.relative], excludedTraining.has(entry.relative));
+  }
+
   // Lazy list thumbnails: only items scrolled into view are loaded, two at a time.
   function drawThumb(image) {
     const side = 72;
@@ -249,7 +295,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   }
   function applyThumb(entry) {
     const url = thumbCache.get(entry.image);
-    const slot = byId("tools-files").querySelector('[data-index="' + entries.indexOf(entry) + '"]')?.firstElementChild;
+    const slot = byId("tools-files").querySelector('.tool-image-item[data-index="' + entries.indexOf(entry) + '"]')?.firstElementChild;
     if (!url || !slot || slot.tagName === "IMG") return;
     const picture = document.createElement("img");
     picture.src = url;
@@ -290,6 +336,16 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     list.replaceChildren();
     entries.forEach((entry, index) => {
       if (filter && !filter.set.has(entry.relative)) return;
+      const row = document.createElement("div");
+      row.className = "tool-image-row" + (excludedTraining.has(entry.relative) ? " excluded" : "");
+      const useBox = document.createElement("input");
+      useBox.type = "checkbox";
+      useBox.className = "train-check";
+      useBox.dataset.relative = entry.relative;
+      useBox.checked = !excludedTraining.has(entry.relative);
+      useBox.title = "Use this image for LoRA training";
+      useBox.setAttribute("aria-label", "Use " + entry.relative + " for LoRA training");
+      useBox.addEventListener("change", () => setTrainingUse([entry.relative], useBox.checked));
       const button = document.createElement("button");
       button.type = "button";
       button.className = "tool-image-item";
@@ -331,7 +387,8 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
           selectImage(index).catch(notice);
         }
       });
-      list.append(button);
+      row.append(useBox, button);
+      list.append(row);
     });
     updateControls();
   }
@@ -347,8 +404,10 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       caption: captionDirty ? byId("tools-caption-text").value : null,
       guidance: structuredClone(guidance)
     });
+    scheduleAutosave();
   }
   function scheduleDraft(delay = 600) {
+    editRev++;
     clearTimeout(draftTimer);
     draftTimer = setTimeout(() => { draftTimer = 0; writeDraft().catch(() => {}); }, delay);
   }
@@ -519,6 +578,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       anchor = -1;
       loadedRoot = root;
       reviewed = loadReviewed();
+      loadTrainingSelection();
       thumbCache.clear();
       thumbQueue.length = 0;
       thumbGeneration++;
@@ -1028,6 +1088,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     await flushDraft();
     updateControls();
     if (checkInfo.size) recomputeCheck();
+    scheduleAutosave();
     byId("tools-tags-status").textContent = label + ": inserted into " + changed + ", unchanged " + (targets.length - changed - failed.length) + (failed.length ? ", failed " + failed.length : "") + ". Write them out with “Save all changes”.";
     if (failed.length) throw new Error("Could not insert into: " + failed.join(" / "));
   }
@@ -1073,11 +1134,17 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     } finally { saving = false; updateControls(); }
   }
   const dedupeOnSave = (text) => (byId("tools-dedupe-save").checked ? dedupeTags(text) || text : text);
-  async function saveAll() {
-    if (busy() || !entries.length) return;
+  async function saveAll(options = {}) {
+    const auto = options.auto === true;
+    if (busy() || !entries.length) return "idle";
     await flushDraft();
+    const revision = editRev;
     const pendingDrafts = await drafts.listByRoot(loadedRoot);
-    if (!pendingDrafts.length) { updateControls(); return; }
+    if (!pendingDrafts.length) { updateControls(); return "idle"; }
+    if (auto && pendingDrafts.some((draft) => draft.mask) && !String(getProject().mask_dir ?? "").trim()) {
+      byId("tools-autosave-status").textContent = "Auto-save paused: set the Mask output folder";
+      return "paused";
+    }
     const maskDir = pendingDrafts.some((draft) => draft.mask) ? required(getProject().mask_dir, "Mask output") : "";
     const captionOutput = captionDir();
     saving = true;
@@ -1094,12 +1161,13 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
             entry.mask = await invoke("save_tool_mask", { request: { root: loadedRoot, image: entry.image, output_dir: maskDir, content: draft.mask } });
             entry.maskRev = (entry.maskRev ?? 0) + 1;
             rest.mask = null;
-            if (entry === current()) maskDirty = false;
+            if (entry === current() && editRev === revision) maskDirty = false;
           }
-          if (typeof draft.caption === "string") {
+          // Auto-save never writes an empty caption (the draft stays until you type something).
+          if (typeof draft.caption === "string" && !(auto && !draft.caption.trim())) {
             await invoke("save_tool_caption", { request: { root: loadedRoot, image: entry.image, output_dir: captionOutput, content: dedupeOnSave(required(draft.caption, "Caption")) } });
             rest.caption = null;
-            if (entry === current()) captionDirty = false;
+            if (entry === current() && editRev === revision) captionDirty = false;
           }
           saved++;
         } catch (error) { failures.push(entry.relative + ": " + (error?.message ?? error)); }
@@ -1108,9 +1176,41 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
         entry.draft = rest.mask || typeof rest.caption === "string" ? { mask: Boolean(rest.mask), caption: typeof rest.caption === "string" } : null;
       }
     } finally { saving = false; renderFiles(); }
-    byId("tools-dirty").textContent = "Saved changes for " + saved + (saved === 1 ? " image" : " images") + (failures.length ? " (" + failures.length + " failed)" : "");
-    notice(failures.length ? new Error("Could not save: " + failures.join(" / ")) : "");
+    if (editRev !== revision) scheduleDraft(0); // you kept editing while it saved: keep those edits as a draft
+    if (auto) {
+      byId("tools-autosave-status").textContent = failures.length
+        ? "Auto-save failed for " + failures.length + " " + (failures.length === 1 ? "image" : "images")
+        : "Auto-saved " + saved + (saved === 1 ? " image" : " images") + " at " + new Date().toLocaleTimeString();
+      if (failures.length) notice(new Error("Could not auto-save: " + failures.join(" / ")));
+    } else {
+      byId("tools-dirty").textContent = "Saved changes for " + saved + (saved === 1 ? " image" : " images") + (failures.length ? " (" + failures.length + " failed)" : "");
+      notice(failures.length ? new Error("Could not save: " + failures.join(" / ")) : "");
+    }
+    return failures.length ? "failed" : "saved";
   }
+
+  // ---- auto-save: edits reach the files a few seconds after you stop ----
+  const autosaveDelay = () => Math.max(200, Number(window.__autosaveDelay) || 8000);
+  function scheduleAutosave() {
+    clearTimeout(autosaveTimer);
+    if (!byId("tools-autosave").checked) return;
+    autosaveTimer = setTimeout(() => runAutosave().catch(notice), autosaveDelay());
+  }
+  async function runAutosave() {
+    autosaveTimer = 0;
+    if (!byId("tools-autosave").checked || !entries.length) return;
+    // Never in the middle of a stroke or while a job / another save is running: try again shortly.
+    if (stroke || pan || adjust || busy()) { autosaveTimer = setTimeout(() => runAutosave().catch(notice), autosaveDelay()); return; }
+    const result = await saveAll({ auto: true });
+    if (result === "paused") autosaveTimer = setTimeout(() => runAutosave().catch(notice), autosaveDelay());
+  }
+  byId("tools-autosave").addEventListener("change", () => {
+    byId("tools-autosave-status").textContent = byId("tools-autosave").checked ? "" : "Auto-save is off";
+    if (byId("tools-autosave").checked) scheduleAutosave(); else clearTimeout(autosaveTimer);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden && byId("tools-autosave").checked && entries.length) { clearTimeout(autosaveTimer); runAutosave().catch(notice); }
+  });
   byId("tools-save-all").addEventListener("click", () => saveAll().catch(notice));
   byId("tools-save-mask").addEventListener("click", () => save("mask").catch(notice));
   byId("tools-save-caption").addEventListener("click", () => save("caption").catch(notice));
@@ -1163,6 +1263,11 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   byId("tools-op-reset").addEventListener("click", () => restoreMask("saved").catch(notice));
   byId("tools-op-original").addEventListener("click", () => restoreMask("original").catch(notice));
 
+  byId("tools-train-toggle").addEventListener("click", toggleTraining);
+  byId("tools-train-all").addEventListener("click", () => setTrainingSelection(new Set(entries.map((entry) => entry.relative))));
+  byId("tools-train-none").addEventListener("click", () => setTrainingSelection(new Set()));
+  byId("tools-train-invert").addEventListener("click", () => setTrainingSelection(new Set(entries.filter((entry) => excludedTraining.has(entry.relative)).map((entry) => entry.relative))));
+  byId("tools-train-highlighted").addEventListener("click", () => setTrainingSelection(new Set([...checked].map((index) => entries[index]?.relative).filter(Boolean))));
   byId("tools-prev").addEventListener("click", () => step(-1));
   byId("tools-next").addEventListener("click", () => step(1));
   byId("tools-next-unreviewed").addEventListener("click", goNextUnreviewed);
@@ -1387,6 +1492,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       await drafts.put({ root: loadedRoot, relative: entry.relative, mask: existing?.mask ?? null, caption: text, guidance: existing?.guidance ?? [] });
       entry.draft = { mask: Boolean(existing?.mask), caption: true };
     }
+    scheduleAutosave();
   }
   async function bulkEditCaptions(candidates, transform, label) {
     if (busy() || !candidates.length) return 0;
@@ -1504,6 +1610,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     else if (key === "PageDown" || key === ".") step(1);
     else if (key.toLowerCase() === "n") goNextUnreviewed();
     else if (key.toLowerCase() === "r") toggleReviewed();
+    else if (key.toLowerCase() === "t") toggleTraining();
     else if (mode === "mask" && !busy()) {
       const lower = key.toLowerCase();
       const size = byId("tools-brush-size");
@@ -1553,6 +1660,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       checked = new Set();
       anchor = -1;
       reviewed = new Set();
+      excludedTraining.clear();
       guidance = [];
       filter = null;
       checkInfo = new Map();

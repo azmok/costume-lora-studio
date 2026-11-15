@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 from io import BytesIO
+import importlib.util
 import json
 import logging
 import math
@@ -172,7 +173,8 @@ def generate_masks(payload: dict, segmenter_factory=None) -> Path:
 
 def create_dataset(payload: dict) -> Path:
     args = options(payload)
-    args.mask_dir = local_path(payload, "mask_dir")
+    args.transparent = flag(payload, "transparent", False)
+    args.mask_dir = None if args.transparent else local_path(payload, "mask_dir")
     if payload.get("caption_dir"):
         args.caption_dir = local_path(payload, "caption_dir")
     args.trigger_word = text(payload, "trigger_word")
@@ -359,11 +361,89 @@ def contained(root: Path, relative: str) -> Path:
     return path
 
 
+def normalize_source(value: str) -> str:
+    text_value = str(value).replace("\\", "/").strip()
+    return text_value.removeprefix("./").casefold()
+
+
+def excluded_sources(payload: dict) -> set:
+    """Images unchecked in the Tools tab (paths relative to the source folder); empty = use everything."""
+    value = payload.get("excluded_sources")
+    if value is None:
+        return set()
+    if not isinstance(value, list) or len(value) > 200000 or not all(isinstance(item, str) for item in value):
+        raise ValueError("excluded_sources must be a list of image paths")
+    return {normalize_source(item) for item in value}
+
+
+def materialize_selection(selection: dict) -> None:
+    """Build the folder the trainer reads when some images are unchecked: links (or copies) of the chosen
+    images, captions and masks only. The prepared dataset itself is never touched."""
+    root = selection["root"]
+    for image_path, mask_path, caption_path, relative in selection["files"]:
+        image_target = root / "images" / relative
+        pairs = [(image_path, image_target), (caption_path, image_target.with_suffix(".txt"))]
+        if mask_path is not None:
+            pairs.append((mask_path, root / "masks" / relative))
+        for source, target in pairs:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                continue
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+
+
+OPTIMIZER_PACKAGES = {
+    "AdamW": None, "AdamW8bit": ("bitsandbytes", "bitsandbytes"), "PagedAdamW8bit": ("bitsandbytes", "bitsandbytes"),
+    "Lion": ("lion_pytorch", "lion-pytorch"), "SGDNesterov": None,
+    "DAdaptAdam": ("dadaptation", "dadaptation"), "DAdaptation": ("dadaptation", "dadaptation"),
+    "Prodigy": ("prodigyopt", "prodigyopt"), "Adafactor": None,
+}
+ADAPTIVE_OPTIMIZERS = ("DAdaptAdam", "DAdaptation", "Prodigy")
+LR_SCHEDULERS = ("constant", "constant_with_warmup", "linear", "cosine", "cosine_with_restarts", "polynomial")
+
+
+def choice(payload: dict, key: str, default, allowed):
+    value = payload.get(key, default)
+    if isinstance(value, bool) or value not in allowed:
+        raise ValueError(f"{key}: choose one of {', '.join(str(item) for item in allowed)}")
+    return value
+
+
+def flag(payload: dict, key: str, default: bool) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key}: must be true or false")
+    return value
+
+
+def optimizer_args(payload: dict) -> list:
+    value = payload.get("optimizer_args", "")
+    if not isinstance(value, str) or len(value) > 300:
+        raise ValueError("optimizer_args: enter key=value pairs separated by spaces")
+    tokens = value.split()
+    for token in tokens:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[^ ]+", token):
+            raise ValueError("optimizer_args: use the form key=value key2=value2")
+    return tokens
+
+
+def optimizer_package_problem(name: str):
+    """Returns a message when the optimizer needs a Python package that is not installed, else None."""
+    package = OPTIMIZER_PACKAGES.get(name)
+    if package and importlib.util.find_spec(package[0]) is None:
+        return f"Optimizer {name} needs the Python package {package[0]}. Install it with: pip install {package[1]} (or pick another optimizer)"
+    return None
+
+
 def training_plan(payload: dict) -> dict:
     from PIL import Image
 
+    alpha_mask = flag(payload, "alpha_mask", False)
+    use_masks = flag(payload, "use_masks", True) and not alpha_mask
     dataset = local_path(payload, "dataset_dir")
-    masks = local_path(payload, "mask_dir")
     engine = local_path(payload, "engine_dir")
     checkpoint = local_path(payload, "checkpoint", "file")
     tokenizer = local_path(payload, "tokenizer_dir")
@@ -375,25 +455,46 @@ def training_plan(payload: dict) -> dict:
         if not (tokenizer / "openai_clip-vit-large-patch14" / name).is_file():
             raise ValueError(f"Offline CLIP tokenizer is missing: {name}")
     metadata = json.loads((dataset / "metadata.json").read_text(encoding="utf-8"))
+    if metadata.get("settings", {}).get("transparent") and not alpha_mask:
+        raise ValueError("This dataset uses transparency. Enable All images use transparency (alpha mask).")
+    masks = local_path(payload, "mask_dir") if use_masks else None
     records = metadata.get("images", [])
     if not isinstance(records, list) or not records:
         raise ValueError("The dataset is empty")
+    unchecked = excluded_sources(payload)
+    left_out = 0
+    if unchecked:
+        kept = [record for record in records if normalize_source(record.get("source", "")) not in unchecked]
+        left_out = len(records) - len(kept)
+        if not kept:
+            raise ValueError("No images are selected for training. Check at least one image in Tools, or turn off “Use only the images selected in Tools”.")
+        records = kept
     groups = set()
+    chosen = []
     for record in records:
         image_path = contained(dataset, record["image"])
         image_relative = image_path.relative_to(dataset / "images")
-        mask_path = contained(masks, image_relative.as_posix())
+        mask_path = None
+        if use_masks:
+            mask_path = contained(masks, image_relative.as_posix())
+            if not mask_path.is_file():
+                raise ValueError(f"No mask for {record.get('source', image_relative.as_posix())}: {mask_path} (create the mask, uncheck this image in Tools, or turn off “Use masks”)")
         caption = image_path.with_suffix(".txt")
         if not caption.is_file() or not caption.read_text(encoding="utf-8").strip():
             raise ValueError(f"Caption is empty or missing: {caption}")
-        with Image.open(image_path) as image, Image.open(mask_path) as mask:
-            if mask.format != "PNG" or mask.mode != "L" or image.size != mask.size:
-                raise ValueError(f"Masks must be 8-bit L PNGs with the same resolution: {mask_path}")
-            if any(mask.histogram()[1:255]) or mask.getextrema() != (0, 255):
-                raise ValueError(f"Masks must be binary images containing both white and black: {mask_path}")
+        with Image.open(image_path) as image:
+            if alpha_mask:
+                generator.load_transparent_image(image_path)
             if min(image.size) < 64:
                 raise ValueError(f"Image short side is too small: {image_path}")
+            if mask_path is not None:
+                with Image.open(mask_path) as mask:
+                    if mask.format != "PNG" or mask.mode != "L" or image.size != mask.size:
+                        raise ValueError(f"Masks must be 8-bit L PNGs with the same resolution: {mask_path}")
+                    if any(mask.histogram()[1:255]) or mask.getextrema() != (0, 255):
+                        raise ValueError(f"Masks must be binary images containing both white and black: {mask_path}")
         groups.add(image_relative.parent.as_posix())
+        chosen.append((image_path, mask_path, caption, image_relative))
     output = Path(text(payload, "output_dir")).resolve()
     if output == dataset or output.is_relative_to(dataset) or dataset.is_relative_to(output):
         raise ValueError("Keep the training output and the dataset in separate folders")
@@ -403,24 +504,53 @@ def training_plan(payload: dict) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", name):
         raise ValueError("LoRA name must start with a letter or digit and use up to 80 letters, digits, _ or -")
     resolution = number(payload, "resolution", 512, 256, 1024, True)
-    rank = number(payload, "rank", 16, 1, 128, True)
-    alpha = number(payload, "alpha", 16, 1, rank)
-    steps = number(payload, "steps", 1000, 1, 1000000, True)
+    rank = number(payload, "rank", 16, 1, 512, True)
+    alpha = number(payload, "alpha", 16, 0.1, rank)
     batch = number(payload, "batch_size", 1, 1, 16, True)
-    learning_rate = number(payload, "learning_rate", 0.0001, 0.0000001, 0.01)
+    repeats = number(payload, "repeats", 1, 1, 200, True)
+    epochs = number(payload, "epochs", 10, 1, 1000, True)
+    steps = number(payload, "steps", 1000, 0 if "epochs" in payload else 1, 1000000, True)
+    learning_rate = number(payload, "learning_rate", 0.0001, 0.0000001, 10)
+    text_encoder_lr = number(payload, "text_encoder_lr", 0, 0, 10)
+    warmup_percent = number(payload, "lr_warmup_percent", 0, 0, 50)
+    cycles = number(payload, "lr_scheduler_num_cycles", 1, 1, 20, True)
     seed = number(payload, "seed", 42, 0, 2147483647, True)
+    min_snr = number(payload, "min_snr_gamma", 0, 0, 20)
+    noise_offset = number(payload, "noise_offset", 0, 0, 1)
+    keep_tokens = number(payload, "keep_tokens", 0, 0, 10, True)
+    clip_skip = choice(payload, "clip_skip", 1, (1, 2))
+    shuffle = flag(payload, "shuffle_caption", False)
+    checkpointing = flag(payload, "gradient_checkpointing", True)
+    optimizer = choice(payload, "optimizer", "AdamW", tuple(OPTIMIZER_PACKAGES))
+    scheduler = choice(payload, "lr_scheduler", "constant", LR_SCHEDULERS)
+    extra_args = optimizer_args(payload)
     precision = payload.get("mixed_precision", "fp16")
     if precision not in ("fp16", "bf16", "no"):
         raise ValueError("mixed_precision: use fp16, bf16 or no")
+    steps_per_epoch = math.ceil(len(records) * repeats / batch)
+    by_epochs = "epochs" in payload and steps == 0
+    total_steps = steps_per_epoch * epochs if by_epochs else (steps or steps_per_epoch * epochs)
+    warnings = []
+    if optimizer in ADAPTIVE_OPTIMIZERS and learning_rate < 0.1:
+        warnings.append(f"{optimizer} adapts the learning rate by itself: set Learning rate to 1 (now {learning_rate:g}).")
     quote = lambda value: json.dumps(str(value), ensure_ascii=False)
     dataset_toml = (
-        '[general]\ncaption_extension = ".txt"\nshuffle_caption = false\n\n'
-        f'[[datasets]]\nresolution = {resolution}\nbatch_size = {batch}\nenable_bucket = true\n'
+        f'[general]\ncaption_extension = ".txt"\nshuffle_caption = {str(shuffle).lower()}\n'
+        + (f"keep_tokens = {keep_tokens}\n" if shuffle and keep_tokens else "")
+        + f'\n[[datasets]]\nresolution = {resolution}\nbatch_size = {batch}\nenable_bucket = true\n'
         'bucket_no_upscale = true\nbucket_reso_steps = 64\nbucket_min_reso = 64\n'
         f'bucket_max_reso = {resolution * 2}\n\n'
     )
+    selection = {"root": output / "selected_dataset", "files": chosen} if left_out else None
+    image_base = selection["root"] / "images" if selection else dataset / "images"
+    mask_base = (selection["root"] / "masks" if selection else masks) if use_masks else None
     for group in sorted(groups):
-        dataset_toml += f'[[datasets.subsets]]\nimage_dir = {quote((dataset / "images" / group).as_posix())}\nconditioning_data_dir = {quote((masks / group).as_posix())}\nnum_repeats = 1\n\n'
+        dataset_toml += f'[[datasets.subsets]]\nimage_dir = {quote((image_base / group).as_posix())}\n'
+        if use_masks:
+            dataset_toml += f'conditioning_data_dir = {quote((mask_base / group).as_posix())}\n'
+        if alpha_mask:
+            dataset_toml += 'alpha_mask = true\n'
+        dataset_toml += f'num_repeats = {repeats}\n\n'
     config = {
         "pretrained_model_name_or_path": checkpoint.as_posix(),
         "dataset_config": (output / "dataset.toml").as_posix(),
@@ -429,23 +559,58 @@ def training_plan(payload: dict) -> dict:
         "tokenizer_cache_dir": tokenizer.as_posix(),
         "network_module": "networks.lora",
         "network_dim": rank, "network_alpha": alpha,
-        "learning_rate": learning_rate, "max_train_steps": steps,
-        "mixed_precision": precision, "save_precision": "float" if precision == "no" else precision,
-        "save_model_as": "safetensors", "optimizer_type": "AdamW",
-        "lr_scheduler": "constant", "seed": seed,
-        "masked_loss": True, "gradient_checkpointing": True,
-        "network_train_unet_only": True, "max_data_loader_n_workers": 0,
-        "save_every_n_steps": max(1, min(250, steps)),
+        "learning_rate": learning_rate,
     }
+    if by_epochs:
+        config["max_train_epochs"] = epochs
+    else:
+        config["max_train_steps"] = total_steps
+    config.update({
+        "mixed_precision": precision, "save_precision": "float" if precision == "no" else precision,
+        "save_model_as": "safetensors", "optimizer_type": optimizer,
+        "lr_scheduler": scheduler, "seed": seed,
+        "masked_loss": use_masks, "gradient_checkpointing": checkpointing,
+        "max_data_loader_n_workers": 0,
+        "save_every_n_steps": max(1, min(250, total_steps)),
+    })
+    if text_encoder_lr > 0:
+        config["text_encoder_lr"] = text_encoder_lr
+        config["unet_lr"] = learning_rate
+    else:
+        config["network_train_unet_only"] = True
+    if extra_args:
+        config["optimizer_args"] = extra_args
+    warmup_steps = round(total_steps * warmup_percent / 100)
+    if warmup_steps:
+        config["lr_warmup_steps"] = warmup_steps
+    if scheduler == "cosine_with_restarts":
+        config["lr_scheduler_num_cycles"] = cycles
+    if min_snr:
+        config["min_snr_gamma"] = min_snr
+    if noise_offset:
+        config["noise_offset"] = noise_offset
+    if clip_skip != 1:
+        config["clip_skip"] = clip_skip
     training_toml = "\n".join(f"{key} = {str(value).lower() if isinstance(value, bool) else json.dumps(value, ensure_ascii=False)}" for key, value in config.items()) + "\n"
     tomllib.loads(training_toml)
     tomllib.loads(dataset_toml)
-    return {"output": output, "engine": engine, "dataset_toml": dataset_toml, "training_toml": training_toml, "samples": len(records)}
+    return {"output": output, "engine": engine, "dataset_toml": dataset_toml, "training_toml": training_toml,
+            "samples": len(records), "left_out": left_out, "selection": selection,
+            "total_steps": total_steps, "steps_per_epoch": steps_per_epoch, "optimizer": optimizer, "warnings": warnings}
 
 
 def train(payload: dict, check_only=False) -> None:
     plan = training_plan(payload)
-    emit(f"Dataset verified: {plan['samples']} images", type="validated")
+    counts = {"samples": plan["samples"], "total_steps": plan["total_steps"], "steps_per_epoch": plan["steps_per_epoch"]}
+    if plan["left_out"]:
+        emit(f"Dataset verified: using {plan['samples']} of {plan['samples'] + plan['left_out']} images ({plan['left_out']} unchecked in Tools)", type="validated", **counts)
+    else:
+        emit(f"Dataset verified: {plan['samples']} images", type="validated", **counts)
+    for warning in plan["warnings"]:
+        emit("Warning: " + warning)
+    problem = optimizer_package_problem(plan["optimizer"])
+    if problem:
+        raise ValueError(problem)
     import torch
     from transformers import CLIPTokenizer
 
@@ -459,6 +624,8 @@ def train(payload: dict, check_only=False) -> None:
         return
     output = plan["output"]
     output.mkdir(parents=True, exist_ok=True)
+    if plan["selection"]:
+        materialize_selection(plan["selection"])
     (output / "dataset.toml").write_text(plan["dataset_toml"], encoding="utf-8")
     config_path = output / "training.toml"
     config_path.write_text(plan["training_toml"], encoding="utf-8")

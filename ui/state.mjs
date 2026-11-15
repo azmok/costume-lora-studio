@@ -1,12 +1,11 @@
+import { DEFAULT_PARAMS, validateParams } from "./training-params.mjs";
+
 export const PROJECT_DEFAULTS = {
   raw_dir: "", mask_dir: "", caption_dir: "", dataset_dir: "", train_masks: "",
   training_dir: "", trigger_word: "", checkpoint: "", output_name: "my_costume"
 };
 
-export const TRAINING_DEFAULTS = {
-  steps: 1000, batch_size: 1, rank: 16, alpha: 16,
-  learning_rate: 0.0001, seed: 42, mixed_precision: "fp16"
-};
+export const TRAINING_DEFAULTS = { ...DEFAULT_PARAMS };
 
 export function required(value, label) {
   if (typeof value !== "string" || !value.trim()) throw new Error(label + " is required");
@@ -14,24 +13,7 @@ export function required(value, label) {
 }
 
 export function validateTraining(values) {
-  const rules = {
-    steps: [1, 1000000, true], batch_size: [1, 16, true],
-    rank: [1, 128, true], alpha: [1, 128, false],
-    learning_rate: [0.0000001, 0.01, false], seed: [0, 2147483647, true]
-  };
-  const result = { ...values };
-  for (const [key, [minimum, maximum, integer]] of Object.entries(rules)) {
-    if (values[key] === "" || values[key] == null) throw new Error(key + " is required");
-    const value = Number(values[key]);
-    if (!Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isInteger(value))) {
-      throw new Error(key + " is out of range");
-    }
-    result[key] = value;
-  }
-  if (result.alpha > result.rank) throw new Error("Alpha must be no greater than Rank");
-  if (values.mixed_precision !== undefined && !["fp16", "bf16", "no"].includes(values.mixed_precision)) {
-    throw new Error("Invalid Mixed precision value");
-  }
+  const result = validateParams(values);
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$/.test(values.output_name)) throw new Error("LoRA name may only use letters, digits, _ and -");
   return result;
 }

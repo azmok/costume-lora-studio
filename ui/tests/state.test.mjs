@@ -15,7 +15,7 @@ test("empty and Enter-only values cannot start a job", () => {
 test("training boundaries and invalid numeric values", () => {
   assert.deepEqual(validateTraining(defaults), defaults);
   for (const patch of [
-    { steps: 0 }, { steps: 1.5 }, { steps: "" }, { rank: 129 },
+    { steps: -1 }, { steps: 1.5 }, { steps: "" }, { rank: 513 },
     { alpha: 17 }, { learning_rate: NaN }, { batch_size: -1 }, { seed: Infinity },
     { output_name: "../file" }, { output_name: "" }
   ]) assert.throws(() => validateTraining({ ...defaults, ...patch }));

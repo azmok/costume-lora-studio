@@ -103,6 +103,7 @@ def main():
         page.locator("#tools-load").click()
         expect(page.locator(".tool-image-item")).to_have_count(3)
         expect(page.locator("#tools-canvas")).to_be_visible()
+        page.evaluate("window.__autosaveDelay = 600000")  # keep auto-save out of the way until its own test
         # one panel: no Caption / Mask Paint tabs; the caption box and the brush controls are on screen together
         expect(page.locator("#tools-mode-caption")).to_have_count(0)
         expect(page.locator("#tools-caption-text")).to_be_visible()
@@ -575,6 +576,155 @@ def main():
         page.locator("#job-bar-dismiss").click()
         expect(bar).to_be_hidden()
         page.evaluate("window.scrollTo(0, 0)")
+
+        # --- auto-save: edits reach the files a few seconds after you stop editing --------------------
+        def saved_captions():
+            return page.evaluate("window.calls.filter((call) => call.name === 'save_tool_caption').map((call) => call.args.request.content)")
+
+        page.locator("#tab-tools").click()
+        expect(page.locator("#tools-autosave")).to_be_checked()  # on by default
+        page.locator("#tools-mask-dir").fill("C:/masks")  # earlier steps left mask drafts; auto-save needs the mask output folder
+        page.evaluate("window.__autosaveDelay = 300")
+        page.locator(".tool-image-item").first.click()
+        expect(page.locator("#tools-image-name")).to_have_text("a.png")
+        page.locator("#tools-caption-text").fill("trig, auto saved caption")
+        page.wait_for_function("window.calls.some((call) => call.name === 'save_tool_caption' && call.args.request.content.includes('auto saved caption'))", timeout=8000)
+        expect(page.locator("#tools-autosave-status")).to_contain_text("Auto-saved")
+        expect(page.locator(".tool-image-item.has-draft")).to_have_count(0)  # nothing is left unsaved
+        page.locator("#tools-autosave").uncheck()  # off: edits stay drafts
+        expect(page.locator("#tools-autosave-status")).to_contain_text("off")
+        page.locator("#tools-caption-text").fill("trig, manual only")
+        page.wait_for_timeout(1200)
+        assert not any("manual only" in text for text in saved_captions())
+        expect(page.locator(".tool-image-item.has-draft")).to_have_count(1)
+        page.locator("#tools-autosave").check()  # on again: the pending edit is written
+        page.wait_for_function("window.calls.some((call) => call.name === 'save_tool_caption' && call.args.request.content.includes('manual only'))", timeout=8000)
+        page.locator("#tools-caption-text").fill("")  # an empty caption is never auto-saved
+        page.wait_for_timeout(1200)
+        assert "" not in saved_captions()
+        page.locator("#tools-caption-text").fill("trig, auto saved caption")
+        page.locator("#tools-mask-dir").fill("")
+        page.locator("#tools-op-invert").click()  # a mask edit needs the mask output folder
+        expect(page.locator("#tools-autosave-status")).to_contain_text("paused", timeout=8000)
+        masks_before = page.evaluate("window.calls.filter((call) => call.name === 'save_tool_mask').length")
+        page.locator("#tools-mask-dir").fill("C:/masks")  # once it is set, the paused auto-save resumes by itself
+        page.wait_for_function("(before) => window.calls.filter((call) => call.name === 'save_tool_mask').length > before", arg=masks_before, timeout=8000)
+        expect(page.locator("#tools-autosave-status")).to_contain_text("Auto-saved")
+        page.evaluate("window.__autosaveDelay = 600000")
+
+        # --- training selection: uncheck images in Tools, train on the checked ones only -------------
+        page.locator("#tab-tools").click()
+        expect(page.locator(".train-check")).to_have_count(3)
+        for box in page.locator(".train-check").all():
+            expect(box).to_be_checked()  # every image is used by default
+        expect(page.locator("#tools-count")).to_contain_text("3 for training")
+        page.locator(".tool-image-row").nth(1).locator(".train-check").uncheck()  # b.png
+        expect(page.locator(".tool-image-row").nth(1)).to_have_class(re.compile("excluded"))
+        expect(page.locator("#tools-count")).to_contain_text("2 for training")
+        page.evaluate("document.activeElement && document.activeElement.blur()")
+        page.keyboard.press("t")  # T toggles the open image (a.png)
+        expect(page.locator("#tools-count")).to_contain_text("1 for training")
+        page.keyboard.press("t")
+        expect(page.locator("#tools-count")).to_contain_text("2 for training")
+        page.locator("#tools-train-none").click()
+        expect(page.locator("#tools-count")).to_contain_text("0 for training")
+        page.locator("#tools-train-all").click()
+        expect(page.locator("#tools-count")).to_contain_text("3 for training")
+        page.locator("#tools-train-none").click()
+        page.locator(".tool-image-row").nth(1).locator(".train-check").check()
+        page.locator("#tools-train-invert").click()  # used = {b} -> used = {a, c}: only b.png is left out
+        expect(page.locator("#tools-count")).to_contain_text("2 for training")
+        expect(page.locator(".tool-image-row").nth(1)).to_have_class(re.compile("excluded"))
+        # the Train tab explains it and sends the unchecked images with the job
+        page.locator("#tab-train").click()
+        expect(page.locator("#tools-selection-summary")).to_contain_text("Training will use 2 of 3 images")
+        page.locator("#checkpoint").fill("C:/models/sd15.safetensors")
+        page.locator("#train-dataset").fill("C:/datasets/processed")
+        page.locator("#train-output").fill("C:/outputs/run01")
+        page.locator("#validate-training").click()
+        page.wait_for_function("window.calls.some((call) => call.name === 'start_job' && call.args.kind === 'validate')")
+        sent = page.evaluate("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'validate').at(-1).args")
+        assert sent["payload"]["excluded_sources"] == ["b.png"], sent
+        send(status="succeeded")
+        page.locator("#job-bar-dismiss").click()
+        page.locator("#use-tools-selection").uncheck()  # ignore the Tools selection: everything is trained
+        expect(page.locator("#tools-selection-summary")).to_contain_text("ignored")
+        page.locator("#validate-training").click()
+        page.wait_for_function("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'validate').length === 2")
+        sent = page.evaluate("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'validate').at(-1).args")
+        assert "excluded_sources" not in sent["payload"], sent
+        send(status="succeeded")
+        page.locator("#job-bar-dismiss").click()
+        page.locator("#use-tools-selection").check()
+        page.locator("#tab-tools").click()
+        page.locator("#tools-train-all").click()
+
+        # --- training parameters: dropdowns, built-in presets, repeats, and the total steps / time summary ---
+        page.locator("#tab-train").click()
+        expect(page.locator("#optimizer option")).to_have_count(9)
+        expect(page.locator("#scheduler option")).to_have_count(6)
+        expect(page.locator("#training-profile optgroup")).to_have_count(4)  # Recommended, Community, Basic (+ hidden My presets)
+        expect(page.locator("#sum-images")).to_have_text("3")  # every image is checked in Tools again
+        expect(page.locator("#summary-formula")).to_contain_text("Max train steps is set")
+        page.locator("#training-profile").select_option("builtin:clothing-masked")  # applies as soon as it is picked
+        expect(page.locator("#preset-description")).to_contain_text("Masked loss")
+        for field, value in (("optimizer", "AdamW8bit"), ("scheduler", "cosine"), ("rank", "32"), ("alpha", "16"), ("repeats", "8"),
+                             ("batch-size", "2"), ("epochs", "10"), ("steps", "0"), ("text-encoder-lr", "0.00005")):
+            expect(page.locator("#" + field)).to_have_value(value)
+        expect(page.locator("#use-masks")).to_be_checked()
+        expect(page.locator("#training-mode-label")).to_have_text("SD1.5 · Masked LoRA")
+        expect(page.locator("#sum-spe")).to_have_text("12")  # 3 images x 8 repeats / batch 2
+        expect(page.locator("#sum-total")).to_have_text("120")
+        expect(page.locator("#sum-time")).to_contain_text("about")
+        expect(page.locator("#summary-note")).to_contain_text("rough guess")
+        page.locator("#training-profile").select_option("builtin:clothing-nomask")
+        expect(page.locator("#use-masks")).not_to_be_checked()
+        for field, value in (("rank", "16"), ("alpha", "8"), ("repeats", "6"), ("epochs", "8")):
+            expect(page.locator("#" + field)).to_have_value(value)
+        expect(page.locator("#training-mode-label")).to_contain_text("no masks")
+        assert page.evaluate("document.getElementById('train-masks').required") is False  # no mask folder is needed
+        expect(page.locator("#sum-total")).to_have_text("72")  # 3 x 6 / 2 = 9 steps per epoch x 8 epochs
+        page.locator("#repeats").fill("10")  # repeats are set in the GUI and the summary follows
+        expect(page.locator("#sum-repeats")).to_have_text("10")
+        expect(page.locator("#sum-spe")).to_have_text("15")
+        expect(page.locator("#sum-total")).to_have_text("120")
+        page.locator("#steps").fill("50")
+        expect(page.locator("#sum-total")).to_have_text("50")
+        expect(page.locator("#summary-formula")).to_contain_text("stops at 50 steps")
+        page.locator("#steps").fill("0")
+        expect(page.locator("#lr-cycles")).to_be_disabled()
+        page.locator("#scheduler").select_option("cosine_with_restarts")
+        expect(page.locator("#lr-cycles")).to_be_enabled()
+        page.locator("#optimizer").select_option("Prodigy")
+        expect(page.locator("#optimizer-hint")).to_contain_text("prodigyopt")
+        expect(page.locator("#optimizer-hint")).to_contain_text("set Learning rate to 1")
+        page.locator("#optimizer-args").fill("oops")
+        page.locator("#validate-training").click()
+        expect(page.locator("#notice")).to_contain_text("Optimizer arguments")
+        page.locator("#optimizer-args").fill("weight_decay=0.01 d_coef=1.0")
+        page.locator("#learning-rate").fill("1")
+        page.locator("#validate-training").click()
+        page.wait_for_function("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'validate').length === 3")
+        sent = page.evaluate("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'validate').at(-1).args")["payload"]
+        assert (sent["optimizer"], sent["lr_scheduler"], sent["repeats"], sent["epochs"], sent["steps"], sent["rank"], sent["resolution"]) == ("Prodigy", "cosine_with_restarts", 10, 8, 0, 16, 512), sent
+        assert sent["use_masks"] is False and "mask_dir" not in sent and sent["optimizer_args"] == "weight_decay=0.01 d_coef=1.0", sent
+        send(message="Dataset verified: 7 images", type="validated", samples=7)
+        assert "7" in page.evaluate("Object.values(JSON.parse(localStorage.getItem('costume-train-images') || '{}')).join(',')")  # remembered for next time
+        send(status="succeeded")
+        page.locator("#job-bar-dismiss").click()
+        page.locator("#training-profile").select_option("builtin:clothing-masked")
+        page.locator("#train-form button[type=submit]").click()  # a real run teaches the time estimate
+        page.wait_for_function("window.calls.some((call) => call.name === 'start_job' && call.args.kind === 'train')")
+        sent = page.evaluate("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'train').at(-1).args")["payload"]
+        assert sent["use_masks"] is True and sent["mask_dir"] == "C:/datasets/processed/masks" and sent["batch_size"] == 2, sent
+        send(message="steps:  10%|█         | 12/120 [00:06<00:54,  2.00it/s, avr_loss=0.1]")
+        expect(page.locator("#summary-note")).to_contain_text("last training run")
+        send(status="succeeded")
+        page.locator("#job-bar-dismiss").click()
+        page.locator("#training-profile").select_option("standard")
+        page.locator("#load-profile").click()
+        expect(page.locator("#steps")).to_have_value("1000")
+        page.locator("#tab-tools").click()
 
         # --- projects: autosave, switching, restore after reload --------------------------------
         page.locator("#tools-trigger").fill("alpha-trigger")

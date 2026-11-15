@@ -97,6 +97,8 @@ def parser() -> argparse.ArgumentParser:
     cli.add_argument("--exclude_prompt", type=nonempty, default=EXCLUDE_PROMPT)
     cli.add_argument("--blacklist", type=Path, help="Additional UTF-8 glob patterns, one per line")
     cli.add_argument("--mask_dir", type=Path, help="Reuse separately generated masks, mirroring source paths as PNG")
+    cli.add_argument("--transparent", "--alpha_mask", dest="transparent", action="store_true",
+                     help="All inputs use transparency as the loss mask; preserve RGBA and skip segmentation")
     cli.add_argument("--caption_dir", type=Path, help="Reuse edited UTF-8 captions, mirroring source paths as TXT")
     cli.add_argument("--download_models", action="store_true", help="Download missing local models from Hugging Face")
     cli.add_argument("--continue_on_error", action="store_true")
@@ -110,6 +112,19 @@ def load_image(path: Path) -> Image.Image:
         oriented = ImageOps.exif_transpose(source).convert("RGBA")
         background = Image.new("RGBA", oriented.size, "white")
         return Image.alpha_composite(background, oriented).convert("RGB")
+
+
+def load_transparent_image(path: Path) -> Image.Image:
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as source:
+        if "A" not in source.getbands() and "transparency" not in source.info:
+            raise ValueError(f"Transparent mode requires an alpha channel: {path}")
+        image = ImageOps.exif_transpose(source).convert("RGBA")
+    low, high = image.getchannel("A").getextrema()
+    if low == 255 or high == 0:
+        raise ValueError(f"Transparent mode requires visible and transparent pixels: {path}")
+    return image
 
 
 TRANSPARENT_LIMIT = 0.01
@@ -412,7 +427,9 @@ def export_configs(root: Path, final: Path, args: argparse.Namespace) -> None:
             relative = image_dir.relative_to(root / "images").as_posix()
             image_group = images + "/" + relative
             mask_group = masks + "/" + relative
-            config += f'[[datasets.subsets]]\nimage_dir = {json.dumps(image_group, ensure_ascii=False)}\nconditioning_data_dir = {json.dumps(mask_group, ensure_ascii=False)}\nnum_repeats = 1\n\n'
+            config += f'[[datasets.subsets]]\nimage_dir = {json.dumps(image_group, ensure_ascii=False)}\n'
+            config += 'alpha_mask = true\n' if getattr(args, "transparent", False) else f'conditioning_data_dir = {json.dumps(mask_group, ensure_ascii=False)}\n'
+            config += 'num_repeats = 1\n\n'
             toolkit_datasets.append({"folder_path": image_group, "mask_path": mask_group, "caption_ext": "txt", "resolution": [args.max_resolution], "default_caption": args.trigger_word, "mask_min_value": 0.0, "is_reg": False})
     (root / "kohya_dataset.toml").write_text(config, encoding="utf-8")
     (root / "ai_toolkit_dataset.json").write_text(json.dumps({"datasets": toolkit_datasets}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -420,6 +437,9 @@ def export_configs(root: Path, final: Path, args: argparse.Namespace) -> None:
 
 def generate(args: argparse.Namespace, captioner_factory=None, segmenter_factory=None) -> Path:
     paths = validate_inputs(args)
+    transparent = getattr(args, "transparent", False)
+    if transparent and args.mask_dir is not None:
+        raise ValueError("--transparent and --mask_dir cannot be combined")
     real_models = captioner_factory is None and args.caption_dir is None
     if args.caption_dir is not None:
         if not args.caption_dir.is_dir():
@@ -442,7 +462,7 @@ def generate(args: argparse.Namespace, captioner_factory=None, segmenter_factory
             mask_path = mask_root / path.relative_to(Path(args.input_dir).resolve()).with_suffix(".png")
             if not mask_path.is_file():
                 raise ValueError(f"Mask missing: {mask_path}")
-    if segmenter_factory is None and args.mask_dir is None:
+    if segmenter_factory is None and args.mask_dir is None and not transparent:
         require_snapshot(args.dino_model_dir, download=getattr(args, "download_models", False))
         require_snapshot(args.sam_model_dir, download=getattr(args, "download_models", False))
         segmenter_factory = GroundedSAM
@@ -463,11 +483,11 @@ def generate(args: argparse.Namespace, captioner_factory=None, segmenter_factory
         for path in paths:
             image_path = None
             try:
-                image = load_image(path)
+                image = load_transparent_image(path) if transparent else load_image(path)
                 if args.caption_dir is not None:
                     caption = validate_caption((args.caption_dir / path.relative_to(source).with_suffix(".txt")).read_text(encoding="utf-8"))
                 else:
-                    caption = captioner.caption(image).strip()
+                    caption = captioner.caption(load_image(path) if transparent else image).strip()
                 if args.caption_mode == "vlm":
                     validate_caption(caption)
                 if caption != args.trigger_word and not caption.startswith(args.trigger_word + ","):
@@ -494,13 +514,15 @@ def generate(args: argparse.Namespace, captioner_factory=None, segmenter_factory
             release_models()
         if not records:
             raise ValueError("No images survived caption generation")
-        segmenter = segmenter_factory(args) if args.mask_dir is None else None
+        segmenter = segmenter_factory(args) if args.mask_dir is None and not transparent else None
         successful = []
         for record in records:
             image_path = staging / record["image"]
             try:
-                image = load_image(image_path)
-                if args.mask_dir is not None:
+                image = load_transparent_image(image_path) if transparent else load_image(image_path)
+                if transparent:
+                    mask = image.getchannel("A")
+                elif args.mask_dir is not None:
                     from PIL import Image
 
                     with Image.open(args.mask_dir / Path(record["source"]).with_suffix(".png")) as source_mask:
@@ -508,9 +530,15 @@ def generate(args: argparse.Namespace, captioner_factory=None, segmenter_factory
                 else:
                     mask = segmenter.segment(image)
                 size = target_size(image.size, args.max_resolution, args.resize_edge, args.upscale)
-                image, mask = resize_pair(image, mask, size)
+                if transparent:
+                    from PIL import Image
+
+                    image = image.resize(size, Image.Resampling.LANCZOS)
+                    mask = image.getchannel("A")
+                else:
+                    image, mask = resize_pair(image, mask, size)
                 coverage = float(np.count_nonzero(np.asarray(mask)) / (mask.width * mask.height))
-                if not args.min_mask_fraction <= coverage <= args.max_mask_fraction:
+                if not transparent and not args.min_mask_fraction <= coverage <= args.max_mask_fraction:
                     raise ValueError(f"Suspicious mask coverage: {coverage:.4f}")
                 image.save(image_path)
                 mask_path = staging / record["mask"]
