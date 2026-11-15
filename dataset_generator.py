@@ -419,7 +419,7 @@ def export_configs(root: Path, final: Path, args: argparse.Namespace) -> None:
         '[[datasets]]\n'
         f'resolution = {args.max_resolution}\nbatch_size = 1\nenable_bucket = true\n'
         'bucket_no_upscale = true\nbucket_reso_steps = 64\n'
-        f'bucket_min_reso = 64\nbucket_max_reso = {max(1024, args.max_resolution * 2)}\n\n'
+        f'min_bucket_reso = 64\nmax_bucket_reso = {max(1024, args.max_resolution * 2)}\n\n'
     )
     toolkit_datasets = []
     for image_dir in sorted((root / "images").rglob("*")):

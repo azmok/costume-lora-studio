@@ -624,8 +624,8 @@ def training_plan(payload: dict) -> dict:
         f'[general]\ncaption_extension = ".txt"\nshuffle_caption = {str(shuffle).lower()}\n'
         + (f"keep_tokens = {keep_tokens}\n" if shuffle and keep_tokens else "")
         + f'\n[[datasets]]\nresolution = {resolution}\nbatch_size = {batch}\nenable_bucket = true\n'
-        'bucket_no_upscale = true\nbucket_reso_steps = 64\nbucket_min_reso = 64\n'
-        f'bucket_max_reso = {resolution * 2}\n\n'
+        'bucket_no_upscale = true\nbucket_reso_steps = 64\nmin_bucket_reso = 64\n'
+        f'max_bucket_reso = {resolution * 2}\n\n'
     )
     selection = {"root": output / "selected_dataset", "files": chosen} if left_out else None
     image_base = selection["root"] / "images" if selection else dataset / "images"

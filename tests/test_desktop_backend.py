@@ -616,6 +616,20 @@ class WorkflowTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "FLUX.1 training needs a CUDA"):
                 desktop.train(payload)
 
+    def test_dataset_toml_uses_only_option_names_sd_scripts_accepts(self):
+        # sd-scripts rejects unknown keys ("extra keys not allowed"); names from library/config_util.py
+        general = {"caption_extension", "shuffle_caption", "keep_tokens"}
+        datasets = {"resolution", "batch_size", "enable_bucket", "bucket_no_upscale", "bucket_reso_steps", "min_bucket_reso", "max_bucket_reso", "subsets"}
+        subsets = {"image_dir", "conditioning_data_dir", "alpha_mask", "num_repeats"}
+        payload = {**self.training_payload(), "shuffle_caption": True, "keep_tokens": 1, "epochs": 2, "steps": 0}
+        for variant in ({}, {"use_masks": False}):
+            config = tomllib.loads(desktop.training_plan({**payload, **variant})["dataset_toml"])
+            self.assertLessEqual(set(config["general"]), general)
+            for dataset in config["datasets"]:
+                self.assertLessEqual(set(dataset), datasets)
+                for subset in dataset["subsets"]:
+                    self.assertLessEqual(set(subset), subsets)
+
     def test_training_rejects_missing_masks(self):
         payload = self.training_payload()
         mask = next(Path(payload["mask_dir"]).rglob("*.png"))
