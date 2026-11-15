@@ -225,3 +225,18 @@ Pillow / NumPy がある環境ではモデルをテスト用実装に置き換�
 二値 PNG・寸法同期・EXIF・透過・通信禁止の一括処理・失敗時の後始末も検証します。
 画像依存がなければ画像関連テストはスキップします。
 本物の重みでの推論精度・VRAM 消費・GPU 互換性は実機確認が必要です。
+
+
+## Transparent images (SD1.5 alpha-mask training)
+
+Use `--transparent` (alias `--alpha_mask`) when every source image has visible and transparent pixels. This preserves RGBA and soft alpha edges and skips segmentation. Existing captions can be reused without loading a caption model:
+
+```powershell
+uv run python dataset_generator.py --input_dir "C:/path/to/transparent-images" --output_dir "dataset/transparent" --trigger_word buruma_gym_uniform --caption_mode tag --caption_dir "C:/path/to/edited-captions" --max_resolution 768 --transparent
+```
+
+In Dataset Preparation, enable **All source images are transparent**. In LoRA, enable **All images use transparency (alpha mask)**. No separate mask folder is required. The trainer receives `alpha_mask = true` in every dataset subset; `masked_loss` stays false because it is the separate-mask mode. The dataset exporter also saves alpha masks for preview / AI Toolkit, but sd-scripts reads the PNG alpha directly. RGB, fully opaque and fully invisible images are rejected in this mode. Never combine `--transparent` with `--mask_dir`.
+
+Alpha excludes the background from loss calculation; it does not teach the model to generate transparent PNGs. Visible people, props and censor marks remain in the training region.
+
+Official reference: https://github.com/kohya-ss/sd-scripts/blob/main/docs/masked_loss_README-ja.md

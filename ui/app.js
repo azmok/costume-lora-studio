@@ -1,4 +1,5 @@
 import { BUILTIN_PRESETS, DEFAULT_PARAMS, OPTIMIZERS, PARAM_FIELDS, PARAM_SCHEMA, SCHEDULERS, builtinPreset, optimizerInfo, parseSpeed, summaryModel, updateSpeed } from "./training-params.mjs";
+import { COMPONENT_KEYS, DEFAULT_FAMILY, FAMILIES, civitaiMismatch, downloadById, downloadItems, familyById, familyParams, normalizeDownloadLink, presetById, presetsFor } from "./model-families.mjs";
 import { PROJECT_DEFAULTS, TRAINING_DEFAULTS, required, validateTraining, applyJobEvent, makeTrainingProfile, readTrainingProfile, normalizePresetName, readPresetStore, upsertPreset, removePreset, serializePresetStore } from "./state.mjs";
 import { createTools } from "./tools.js";
 import { createImageZoom } from "./image-zoom.mjs";
@@ -29,7 +30,7 @@ document.addEventListener("input", (event) => {
   field.setSelectionRange(selectionStart, selectionEnd);
 }, true);
 
-const PATH_KEYS = new Set(["raw_dir", "mask_dir", "caption_dir", "dataset_dir", "train_masks", "training_dir", "checkpoint"]);
+const PATH_KEYS = new Set(["raw_dir", "mask_dir", "caption_dir", "dataset_dir", "train_masks", "training_dir", ...COMPONENT_KEYS]);
 let project = { ...PROJECT_DEFAULTS };
 try {
   const stored = JSON.parse(localStorage.getItem("costume-project") || "{}");
@@ -151,9 +152,13 @@ function syncParameterDependencies() {
   byId("use-masks").disabled = alpha;
   const masks = byId("use-masks").checked && !alpha;
   byId("train-masks").required = masks;
-  byId("training-mode-label").textContent = alpha ? "SD1.5 · Alpha mask LoRA" : masks ? "SD1.5 · Masked LoRA" : "SD1.5 · LoRA (no masks)";
+  byId("training-mode-label").textContent = shortLabel() + (alpha ? " · Alpha mask LoRA" : masks ? " · Masked LoRA" : " · LoRA (no masks)");
   byId("lr-cycles").disabled = byId("scheduler").value !== "cosine_with_restarts";
-  byId("keep-tokens").disabled = !byId("shuffle-caption").checked;
+  const family = currentFamily();
+  for (const id of ["min-snr", "noise-offset", "clip-skip", "shuffle-caption", "text-encoder-lr"]) byId(id).disabled = family.flow;
+  byId("keep-tokens").disabled = family.flow || !byId("shuffle-caption").checked;
+  byId("fp8-base").disabled = !family.fp8;
+  byId("blocks-to-swap").disabled = !family.swap;
   const info = optimizerInfo(byId("optimizer").value);
   const adaptive = ["Prodigy", "DAdaptAdam", "DAdaptation"].includes(byId("optimizer").value);
   const lr = Number(byId("learning-rate").value);
@@ -162,6 +167,120 @@ function syncParameterDependencies() {
   if (adaptive && lr > 0 && lr < 0.1) parts.push("This optimizer adapts the learning rate by itself: set Learning rate to 1.");
   byId("optimizer-hint").textContent = parts.join(" ");
 }
+// ---- model type, model files and downloads ----
+const FAMILY_PATHS_KEY = "costume-family-paths";
+const currentFamily = () => familyById(project.model_family) ?? familyById(DEFAULT_FAMILY);
+const shortLabel = () => currentFamily().short;
+function readFamilyPaths() {
+  try { const data = JSON.parse(localStorage.getItem(FAMILY_PATHS_KEY) || "{}"); return data && typeof data === "object" && !Array.isArray(data) ? data : {}; } catch { return {}; }
+}
+function stashFamilyPaths(familyId) {
+  try { localStorage.setItem(FAMILY_PATHS_KEY, JSON.stringify({ ...readFamilyPaths(), [familyId]: Object.fromEntries(COMPONENT_KEYS.map((key) => [key, project[key] ?? ""])) })); } catch { /* storage unavailable */ }
+}
+function restoreFamilyPaths(familyId) {
+  const saved = readFamilyPaths()[familyId] ?? {};
+  for (const key of COMPONENT_KEYS) project[key] = typeof saved[key] === "string" ? toSlash(saved[key]) : "";
+}
+const componentInput = (key) => byId(key === "checkpoint" ? "checkpoint" : "comp-" + key);
+const currentPaths = () => Object.fromEntries(COMPONENT_KEYS.map((key) => [key, project[key] ?? ""]));
+function familyHint(family) {
+  const lines = [];
+  if (family.id === "sdxl") lines.push("Pony, Illustrious and NoobAI models are SDXL: use this type.");
+  if (family.flow) lines.push("Trains the main network only and caches the text encoder outputs, so Min SNR, noise offset, clip skip and caption shuffle do not apply.");
+  if (family.id !== "sd15") lines.push("Tokenizers are loaded by sd-scripts (the first run may download them). Needs a sd-scripts version that has this model's training script.");
+  for (const item of family.components) if (item.hint) lines.push(item.hint);
+  return lines.join(" ");
+}
+function renderFamilyControls() {
+  const family = currentFamily();
+  const select = byId("model-family");
+  if (!select.options.length) select.replaceChildren(...FAMILIES.map((item) => { const option = document.createElement("option"); option.value = item.id; option.textContent = item.label; return option; }));
+  select.value = family.id;
+  const items = new Map(family.components.map((item) => [item.key, item]));
+  for (const key of COMPONENT_KEYS) {
+    const item = items.get(key);
+    const input = componentInput(key);
+    const row = key === "checkpoint" ? null : document.querySelector('[data-component="' + key + '"]');
+    if (row) row.hidden = !item;
+    input.required = Boolean(item?.required);
+    if (document.activeElement !== input) input.value = project[key] ?? "";
+    const label = key === "checkpoint" ? byId("checkpoint-label") : row?.querySelector("label");
+    if (label && item) label.textContent = item.label + (item.required ? "" : " (optional)");
+  }
+  byId("family-hint").textContent = familyHint(family);
+  const standard = [...byId("training-profile").options].find((option) => option.value === "standard");
+  if (standard) standard.textContent = family.id === "sd15" ? "SD1.5 Clothing LoRA — Default settings" : shortLabel() + " — Default settings";
+  byId("download-source").replaceChildren(...family.downloads.map((item) => { const option = document.createElement("option"); option.value = item.id; option.textContent = item.label; return option; }));
+  renderBuiltinGroups();
+  syncPresetControls();
+  syncParameterDependencies();
+  updateDownloadInfo();
+}
+function updateDownloadInfo() {
+  const family = currentFamily();
+  const bundle = downloadById(family, byId("download-source").value);
+  const parts = [];
+  if (byId("download-url").value.trim()) {
+    parts.push("Downloads the link as the " + family.components[0].label + " (a .safetensors file).");
+  } else if (bundle) {
+    const pending = downloadItems(family, bundle, currentPaths());
+    const gb = pending.reduce((sum, item) => sum + item.gb, 0);
+    parts.push(pending.length ? pending.length + (pending.length === 1 ? " file" : " files") + ", about " + gb.toFixed(1) + " GB. Files you already chose are skipped." : "Every file of this download is already set.");
+    if (bundle.gated) parts.push("Gated: accept the license at huggingface.co/" + bundle.gated + " and set your Hugging Face token in Environment.");
+    if (bundle.note) parts.push(bundle.note);
+  }
+  parts.push("Saved in the Models folder (Environment) under base_models/" + family.id + ".");
+  byId("download-info").textContent = parts.join(" ");
+}
+byId("model-family").addEventListener("change", () => {
+  const previous = currentFamily().id;
+  const next = byId("model-family").value;
+  if (next === previous || !familyById(next)) return;
+  if (document.activeElement && document.activeElement !== document.body && document.activeElement.id !== "model-family") document.activeElement.blur(); // so the fields below refresh
+  stashFamilyPaths(previous);
+  restoreFamilyPaths(next);
+  project.model_family = next;
+  saveProject();
+  renderFamilyControls();
+  const first = presetsFor(next)[0];
+  byId("training-profile").value = BUILTIN_PREFIX + first.id;
+  syncPresetControls();
+  applyBuiltin(first);
+  byId("profile-status").textContent = "Model type changed to " + currentFamily().label + ". Applied “" + first.name + "” — your model files for each type are remembered.";
+  notice("");
+  scheduleProjectSave();
+});
+byId("download-source").addEventListener("change", updateDownloadInfo);
+byId("download-url").addEventListener("input", updateDownloadInfo);
+document.querySelectorAll(".component-row input, #checkpoint").forEach((input) => input.addEventListener("input", updateDownloadInfo));
+byId("download-start").addEventListener("click", async () => {
+  try {
+    const family = currentFamily();
+    const link = byId("download-url").value.trim();
+    let items;
+    if (link) {
+      items = [{ key: "checkpoint", url: normalizeDownloadLink(link) }];
+    } else {
+      const bundle = downloadById(family, byId("download-source").value);
+      items = bundle ? downloadItems(family, bundle, currentPaths()) : [];
+      if (!items.length) throw new Error("Every file of this download is already set — nothing to download.");
+    }
+    await run("download", { model_family: family.id, items, hf_token: byId("hf-token").value.trim(), civitai_key: byId("civitai-key").value.trim() });
+  } catch (error) { notice(error); }
+});
+function onDownloaded(data) {
+  for (const [key, path] of Object.entries(data.files ?? {})) if (COMPONENT_KEYS.includes(key)) project[key] = toSlash(path);
+  saveProject();
+  byId("download-url").value = "";
+  updateDownloadInfo();
+  notice(civitaiMismatch(currentFamily(), data.base_model));
+  scheduleProjectSave();
+}
+for (const [id, key] of [["hf-token", "costume-hf-token"], ["civitai-key", "costume-civitai-key"]]) {
+  try { byId(id).value = localStorage.getItem(key) || ""; } catch { /* storage unavailable */ }
+  byId(id).addEventListener("input", () => { try { localStorage.setItem(key, byId(id).value.trim()); } catch { /* storage unavailable */ } });
+}
+
 const PRESET_KEY = "costume-training-presets";
 const LEGACY_PROFILE_KEY = "costume-training-profile";
 function loadPresets() {
@@ -181,16 +300,18 @@ function persistPresets() {
 const BUILTIN_PREFIX = "builtin:";
 function renderBuiltinGroups() {
   const select = byId("training-profile");
+  select.querySelectorAll("optgroup[data-builtin]").forEach((group) => group.remove());
   const anchor = byId("custom-presets");
   const groups = new Map();
-  for (const item of BUILTIN_PRESETS) {
-    if (!groups.has(item.group)) { const group = document.createElement("optgroup"); group.label = item.group; groups.set(item.group, group); }
+  for (const item of presetsFor(currentFamily().id)) {
+    if (!groups.has(item.group)) { const group = document.createElement("optgroup"); group.label = item.group; group.dataset.builtin = "1"; groups.set(item.group, group); }
     const option = document.createElement("option");
     option.value = BUILTIN_PREFIX + item.id;
     option.textContent = item.name;
     groups.get(item.group).append(option);
   }
   for (const group of groups.values()) select.insertBefore(group, anchor);
+  if (![...select.options].some((option) => option.value === select.value)) select.value = "standard";
 }
 renderBuiltinGroups();
 function renderPresets(selectedName) {
@@ -212,7 +333,7 @@ function selectedPreset() {
 }
 function selectedBuiltin() {
   const value = byId("training-profile").value;
-  return value.startsWith(BUILTIN_PREFIX) ? builtinPreset(value.slice(BUILTIN_PREFIX.length)) : null;
+  return value.startsWith(BUILTIN_PREFIX) ? presetById(currentFamily().id, value.slice(BUILTIN_PREFIX.length)) : null;
 }
 function syncPresetControls() {
   byId("delete-profile").disabled = !selectedPreset();
@@ -249,7 +370,7 @@ byId("load-profile").addEventListener("click", () => {
     if (builtin) {
       applyBuiltin(builtin);
     } else if (!preset) {
-      applyTrainingValues(TRAINING_DEFAULTS);
+      applyTrainingValues(familyParams(currentFamily()));
       byId("profile-status").textContent = "Parameters reset to defaults. Folder paths are unchanged.";
     } else {
       applyTrainingValues(preset.parameters);
@@ -352,6 +473,7 @@ function handleEvent(event) {
   if (!jobUi && job.status === "running") startJobUi(jobKind); // e.g. the app was reopened while a job runs
   updateJobUi(data);
   learnFromTrainingEvent(data);
+  if (data.type === "downloaded") onDownloaded(data);
   toolEditor.handleEvent(event).catch(notice);
   if (data.message && !isTqdmLine(data.message)) log(data.level === "error" ? "[ERROR] " + data.message : data.message);
   if (jobKind === "mask" && data.preview_mask) showLiveMask(data.preview_source, data.preview_mask).catch(notice);
@@ -512,6 +634,7 @@ function learnFromTrainingEvent(data) {
   const next = updateSpeed(loadSpeed(), { rateText: bar.rate, batchSize: lastRun.batchSize, resolution: lastRun.resolution });
   if (next) { try { localStorage.setItem(SPEED_KEY, JSON.stringify(next)); } catch { /* storage unavailable */ } updateTrainingSummary(); }
 }
+renderFamilyControls();
 applyTrainingValues(TRAINING_DEFAULTS); // the form starts with the default parameters
 summaryReady = true;
 updateTrainingSummary();
@@ -531,12 +654,18 @@ async function startTraining(kind) {
     const values = trainingValues();
     const payload = validateTraining({
       ...values,
-      checkpoint: required(project.checkpoint, "SD1.5 model"),
+      model_family: currentFamily().id,
+      checkpoint: required(project.checkpoint, currentFamily().components[0].label),
       dataset_dir: required(project.dataset_dir, "Dataset"),
       mask_dir: values.use_masks && !values.alpha_mask ? required(project.train_masks, "Training masks") : "",
       output_dir: required(project.training_dir, "LoRA output"),
       output_name: required(project.output_name, "LoRA name")
     });
+    for (const item of currentFamily().components.slice(1)) {
+      const path = (project[item.key] ?? "").trim();
+      if (path) payload[item.key] = path;
+      else if (item.required) throw new Error(item.label + " is required — choose the file or download it in the Model section");
+    }
     for (const key of Object.keys(payload)) if (payload[key] === "") delete payload[key]; // optional empty fields use the backend defaults
     const skipped = excludedSources();
     if (skipped.length) payload.excluded_sources = skipped;
@@ -862,7 +991,7 @@ async function init() {
 }
 const toolEditor = createTools({ invoke, run, notice, getProject: () => project, getJob: () => job });
 // ---------- projects: everything you enter is autosaved and restored ----------
-const SNAPSHOT_SKIP = new Set(["image-choice", "tools-zoom", "tools-caption-text", "tools-check-tagfilter"]);
+const SNAPSHOT_SKIP = new Set(["model-family", "download-source", "download-url", "image-choice", "tools-zoom", "tools-caption-text", "tools-check-tagfilter"]);
 function trackedControls() {
   return [...document.querySelectorAll("#page-train, #page-dataset, #page-mask, #page-tools")]
     .flatMap((page) => [...page.querySelectorAll("input, select, textarea")])
@@ -921,6 +1050,7 @@ function applyProjectData(data) {
       project[key] = typeof saved[key] === "string" ? (PATH_KEYS.has(key) ? toSlash(saved[key]) : saved[key]) : PROJECT_DEFAULTS[key];
     }
     saveProject();
+    renderFamilyControls();
     // Sliders drive read-outs and redraws through their input handlers.
     document.querySelectorAll('#page-train input[type="range"], #page-mask input[type="range"], #page-tools input[type="range"]')
       .forEach((range) => range.dispatchEvent(new Event("input", { bubbles: true })));

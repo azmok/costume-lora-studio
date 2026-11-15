@@ -96,3 +96,11 @@ test("a Civitai model of another base model is flagged", () => {
   assert.match(civitaiMismatch(sdxl, "SD 1.5"), /SD 1\.5.*SDXL/);
   assert.equal(civitaiMismatch(familyById("flux"), "Flux.1 D"), "");
 });
+
+test("the link box accepts Civitai IDs and https links, and turns Hugging Face blob pages into file links", async () => {
+  const { normalizeDownloadLink } = await import("../model-families.mjs");
+  assert.equal(normalizeDownloadLink(" 12345 "), "https://civitai.com/models/12345");
+  assert.equal(normalizeDownloadLink("https://civitai.com/models/9?modelVersionId=3"), "https://civitai.com/models/9?modelVersionId=3");
+  assert.equal(normalizeDownloadLink("https://huggingface.co/a/b/blob/main/x.safetensors"), "https://huggingface.co/a/b/resolve/main/x.safetensors");
+  for (const bad of ["", "ftp://x/y", "http://x/y", "abc", "1234567890123"]) assert.throws(() => normalizeDownloadLink(bad), /https|ID/);
+});

@@ -4,10 +4,10 @@ export const STALL_MS = 20000;
 
 const TITLES = {
   caption: "Caption generation", mask: "Mask creation", mask_image: "Auto mask", dataset: "Dataset preparation",
-  validate: "Environment check", train: "LoRA training"
+  validate: "Environment check", train: "LoRA training", download: "Model download"
 };
 const WORK_VERB = {
-  caption: "Captioning", mask: "Creating masks", mask_image: "Selecting", dataset: "Preparing", train: "Training", validate: "Checking"
+  caption: "Captioning", mask: "Creating masks", mask_image: "Selecting", dataset: "Preparing", train: "Training", validate: "Checking", download: "Downloading"
 };
 
 export const jobTitle = (kind) => TITLES[kind] ?? "Job";

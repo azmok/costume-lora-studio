@@ -726,6 +726,86 @@ def main():
         expect(page.locator("#steps")).to_have_value("1000")
         page.locator("#tab-tools").click()
 
+        # --- model type, model files per type, and downloads ------------------------------------------
+        def last_job(kind):
+            return page.evaluate("(kind) => window.calls.filter((call) => call.name === 'start_job' && call.args.kind === kind).at(-1)?.args", kind)
+
+        def finish_job():
+            send(status="succeeded")
+            page.locator("#job-bar-dismiss").click()
+
+        page.locator("#tab-train").click()
+        expect(page.locator("#model-family option")).to_have_count(7)
+        expect(page.locator("#model-family")).to_have_value("sd15")
+        page.locator("#checkpoint").fill("C:/models/sd15.safetensors")
+        page.locator("#model-family").select_option("flux")
+        expect(page.locator("#checkpoint")).to_have_value("")  # every type remembers its own files
+        expect(page.locator('[data-component="clip_l"]')).to_be_visible()
+        expect(page.locator('[data-component="gemma2"]')).to_be_hidden()
+        expect(page.locator("#train-resolution")).to_have_value("1024")  # the type's recommended preset is applied
+        expect(page.locator("#training-mode-label")).to_contain_text("FLUX.1")
+        expect(page.locator("#training-profile optgroup[data-builtin] option")).to_have_count(4)
+        for field in ("min-snr", "noise-offset", "clip-skip", "shuffle-caption", "text-encoder-lr"):
+            expect(page.locator("#" + field)).to_be_disabled()  # flow-matching models do not use these
+        expect(page.locator("#blocks-to-swap")).to_be_enabled()
+        expect(page.locator("#download-info")).to_contain_text("4 files")
+        page.locator("#model-family").select_option("anima")
+        expect(page.locator("#fp8-base")).to_be_disabled()  # Anima has no fp8 base
+        page.locator("#model-family").select_option("sdxl")
+        expect(page.locator("#min-snr")).to_be_enabled()
+        expect(page.locator("#blocks-to-swap")).to_be_disabled()
+        page.locator("#model-family").select_option("flux")
+        # bundle download: sends every missing file and the Hugging Face token
+        page.locator("#tab-settings").click()
+        page.locator("#hf-token").fill("hf_test_token")
+        page.locator("#tab-train").click()
+        page.locator("#download-source").select_option("flux-dev")
+        expect(page.locator("#download-info")).to_contain_text("Gated")
+        page.locator("#download-start").click()
+        page.wait_for_function("window.calls.some((call) => call.name === 'start_job' && call.args.kind === 'download')")
+        sent = last_job("download")["payload"]
+        assert sent["model_family"] == "flux" and sent["hf_token"] == "hf_test_token" and len(sent["items"]) == 4, sent
+        assert sent["items"][0]["url"].endswith("/black-forest-labs/FLUX.1-dev/resolve/main/flux1-dev.safetensors"), sent
+        expect(page.locator("#job-bar-title")).to_have_text("Model download")
+        send(message="flux1-dev.safetensors:  30%|███       | 7.1G/23.8G [01:15<02:50, 50MiB/s]")
+        expect(page.locator("#job-bar-percent")).to_have_text("30%")
+        send(message="Downloaded 4 files", type="downloaded", files={"checkpoint": "C:\\models\\base_models\\flux\\flux1-dev.safetensors", "ae": "C:/models/base_models/flux/ae.safetensors",
+                                                                   "clip_l": "C:/models/base_models/flux/clip_l.safetensors", "t5xxl": "C:/models/base_models/flux/t5xxl_fp16.safetensors"}, base_model="")
+        finish_job()
+        expect(page.locator("#checkpoint")).to_have_value("C:/models/base_models/flux/flux1-dev.safetensors")  # filled in, slashes normalized
+        expect(page.locator("#comp-ae")).to_have_value("C:/models/base_models/flux/ae.safetensors")
+        expect(page.locator("#download-info")).to_contain_text("already set")
+        # the training payload carries the type and only that type's files
+        page.locator("#validate-training").click()
+        page.wait_for_function("window.calls.some((call) => call.name === 'start_job' && call.args.kind === 'validate' && call.args.payload.model_family === 'flux')")
+        sent = last_job("validate")["payload"]
+        assert sent["checkpoint"].endswith("flux1-dev.safetensors") and sent["clip_l"].endswith("clip_l.safetensors") and sent["ae"].endswith("ae.safetensors"), sent
+        assert "gemma2" not in sent and sent["resolution"] == 1024 and sent["use_masks"] is True, sent
+        finish_job()
+        # a pasted link or Civitai ID downloads as the base model and a mismatching base model is flagged
+        page.locator("#download-url").fill("123")
+        expect(page.locator("#download-info")).to_contain_text("Downloads the link")
+        page.locator("#download-start").click()
+        page.wait_for_function("window.calls.filter((call) => call.name === 'start_job' && call.args.kind === 'download').length === 2")
+        sent = last_job("download")["payload"]
+        assert sent["items"] == [{"key": "checkpoint", "url": "https://civitai.com/models/123"}], sent
+        send(message="Downloaded 1 file", type="downloaded", files={"checkpoint": "C:/models/base_models/flux/civ.safetensors"}, base_model="SD 1.5")
+        finish_job()
+        expect(page.locator("#checkpoint")).to_have_value("C:/models/base_models/flux/civ.safetensors")
+        expect(page.locator("#notice")).to_contain_text("SD 1.5")
+        expect(page.locator("#download-url")).to_have_value("")
+        page.locator("#download-url").fill("ftp://x/y")
+        page.locator("#download-start").click()
+        expect(page.locator("#notice")).to_contain_text("https://")
+        page.locator("#download-url").fill("")
+        # going back restores the SD1.5 files
+        page.locator("#model-family").select_option("sd15")
+        expect(page.locator("#checkpoint")).to_have_value("C:/models/sd15.safetensors")
+        expect(page.locator('[data-component="clip_l"]')).to_be_hidden()
+        expect(page.locator("#train-resolution")).to_have_value("512")
+        expect(page.locator("#training-mode-label")).to_contain_text("SD1.5")
+        page.locator("#tab-tools").click()
+
         # --- projects: autosave, switching, restore after reload --------------------------------
         page.locator("#tools-trigger").fill("alpha-trigger")
         page.wait_for_function("document.getElementById('project-status').textContent.startsWith('Autosaved')")

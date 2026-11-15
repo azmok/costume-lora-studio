@@ -511,6 +511,111 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual((validated.kwargs["samples"], validated.kwargs["steps_per_epoch"], validated.kwargs["total_steps"]), (1, 4, 12))
         self.assertTrue(any("Warning" in call.args[0] and "Learning rate" in call.args[0] for call in emitted.call_args_list))
 
+    def family_payload(self, family_id, base=None):
+        """A training payload for another model family, with empty stand-in model files and the family's script."""
+        payload = dict(base) if base else self.training_payload()
+        family = desktop.FAMILIES[family_id]
+        engine = Path(payload["engine_dir"])
+        (engine / family["script"]).touch()
+        (engine / (family["modules"][0].replace(".", "/") + ".py")).touch()
+        payload["model_family"] = family_id
+        for key in family["required"] + family["optional"]:
+            if key != "checkpoint":
+                path = self.root / (key + ".safetensors")
+                path.touch()
+                payload[key] = str(path)
+        payload.update({"epochs": 10, "steps": 0, "repeats": 4, "resolution": 1024})
+        return payload
+
+    def test_every_family_builds_its_own_script_arguments_and_network_module(self):
+        base = self.training_payload()
+        for family_id, family in desktop.FAMILIES.items():
+            with self.subTest(family_id):
+                payload = self.family_payload(family_id, base)
+                plan = desktop.training_plan(payload)
+                config = tomllib.loads(plan["training_toml"])
+                self.assertEqual((plan["family"], plan["script"]), (family_id, family["script"]))
+                self.assertEqual(config["network_module"], family["modules"][0])
+                self.assertEqual(config["pretrained_model_name_or_path"], Path(payload["checkpoint"]).as_posix())
+                for key in family["required"]:
+                    if key != "checkpoint":
+                        self.assertEqual(config[key], Path(payload[key]).as_posix())
+                self.assertEqual("tokenizer_cache_dir" in config, family_id == "sd15")
+                self.assertEqual(tomllib.loads(plan["dataset_toml"])["datasets"][0]["resolution"], 1024)
+                for key, value in family["extra"].items():
+                    self.assertEqual(config[key], value)
+
+    def test_flow_models_train_the_main_network_only_and_drop_unsupported_options(self):
+        base = self.training_payload()
+        payload = {**self.family_payload("flux", base), "shuffle_caption": True, "keep_tokens": 1, "min_snr_gamma": 5, "noise_offset": 0.05,
+                   "clip_skip": 2, "text_encoder_lr": 0.00005, "fp8_base": True, "blocks_to_swap": 18}
+        plan = desktop.training_plan(payload)
+        config = tomllib.loads(plan["training_toml"])
+        dataset = tomllib.loads(plan["dataset_toml"])
+        self.assertTrue(config["network_train_unet_only"])
+        for key in ("min_snr_gamma", "noise_offset", "clip_skip", "text_encoder_lr"):
+            self.assertNotIn(key, config)
+        self.assertEqual((config["fp8_base"], config["blocks_to_swap"], config["guidance_scale"]), (True, 18, 1.0))
+        self.assertFalse(dataset["general"]["shuffle_caption"])
+        self.assertEqual(len(plan["warnings"]), 3)  # shuffle, unsupported options, text encoder LR
+        anima = tomllib.loads(desktop.training_plan({**self.family_payload("anima", base), "fp8_base": True})["training_toml"])
+        self.assertNotIn("fp8_base", anima)  # Anima has no fp8 base
+        hunyuan = tomllib.loads(desktop.training_plan({**self.family_payload("hunyuan", base), "fp8_base": True})["training_toml"])
+        self.assertTrue(hunyuan["fp8_scaled"])
+        sdxl = desktop.training_plan({**self.family_payload("sdxl", base), "blocks_to_swap": 4})
+        self.assertNotIn("blocks_to_swap", tomllib.loads(sdxl["training_toml"]))
+        self.assertTrue(any("Block swap" in item for item in sdxl["warnings"]))
+
+    def test_sdxl_uses_the_engines_text_encoder_option_names_and_keeps_the_vae_in_fp32_for_fp16(self):
+        payload = {**self.family_payload("sdxl"), "text_encoder_lr": 0.00001, "mixed_precision": "fp16"}
+        config = tomllib.loads(desktop.training_plan(payload)["training_toml"])
+        self.assertEqual(config["text_encoder_lr"], [0.00001, 0.00001])
+        self.assertTrue(config["no_half_vae"])
+        self.assertNotIn("network_train_unet_only", config)
+        (Path(payload["engine_dir"]) / "train_network.py").write_text('p.add_argument("--text_encoder_lr1")\n--pretrained_model_name_or_path', encoding="utf-8")
+        config = tomllib.loads(desktop.training_plan(payload)["training_toml"])
+        self.assertEqual((config["text_encoder_lr1"], config["text_encoder_lr2"]), (0.00001, 0.00001))
+        unet_only = tomllib.loads(desktop.training_plan({**payload, "text_encoder_lr": 0})["training_toml"])
+        self.assertTrue(unet_only["network_train_unet_only"] and unet_only["cache_text_encoder_outputs"])
+
+    def test_missing_components_wrong_files_and_old_engines_are_explained(self):
+        base = self.training_payload()
+        payload = self.family_payload("flux", base)
+        for key, pattern in (("clip_l", "clip_l: choose the CLIP-L file"), ("ae", "ae: choose the AutoEncoder")):
+            with self.subTest(key):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    desktop.training_plan({**payload, key: ""})
+        with self.assertRaisesRegex(ValueError, "t5xxl: file not found"):
+            desktop.training_plan({**payload, "t5xxl": str(self.root / "missing.safetensors")})
+        ckpt = self.root / "model.ckpt"
+        ckpt.touch()
+        with self.assertRaisesRegex(ValueError, "checkpoint: choose a .safetensors"):
+            desktop.training_plan({**payload, "checkpoint": str(ckpt)})
+        with self.assertRaisesRegex(ValueError, "model_family"):
+            desktop.training_plan({**payload, "model_family": "sd9"})
+        (Path(payload["engine_dir"]) / "flux_train_network.py").unlink()
+        with self.assertRaisesRegex(ValueError, "flux_train_network.py"):
+            desktop.training_plan(payload)
+        sd3 = self.family_payload("sd3", base)  # SD3 text encoders are optional, and the module falls back to networks.lora
+        for key in ("clip_l", "clip_g", "t5xxl"):
+            sd3.pop(key)
+        (Path(sd3["engine_dir"]) / "networks" / "lora_sd3.py").unlink()
+        self.assertEqual(tomllib.loads(desktop.training_plan(sd3)["training_toml"])["network_module"], "networks.lora")
+
+    def test_an_engine_that_lacks_an_option_gets_a_warning(self):
+        payload = self.family_payload("flux")
+        (Path(payload["engine_dir"]) / "train_network.py").write_text("--pretrained_model_name_or_path --network_module --dataset_config", encoding="utf-8")
+        warnings = desktop.training_plan(payload)["warnings"]
+        self.assertTrue(any("guidance_scale" in item for item in warnings))
+
+    def test_non_sd15_families_skip_the_offline_tokenizer_check(self):
+        payload = self.family_payload("flux")
+        payload["tokenizer_dir"] = str(self.root / "nowhere")
+        torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+        with patch.dict("sys.modules", {"torch": torch_stub}), patch("desktop_backend.emit"):
+            with self.assertRaisesRegex(ValueError, "FLUX.1 training needs a CUDA"):
+                desktop.train(payload)
+
     def test_training_rejects_missing_masks(self):
         payload = self.training_payload()
         mask = next(Path(payload["mask_dir"]).rglob("*.png"))

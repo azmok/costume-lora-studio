@@ -19,6 +19,7 @@ import tempfile
 import tomllib
 
 import dataset_generator as generator
+import model_download
 
 
 def emit(message: str, **details) -> None:
@@ -438,6 +439,71 @@ def optimizer_package_problem(name: str):
     return None
 
 
+COMPONENT_LABELS = {
+    "checkpoint": "Base model", "clip_l": "CLIP-L", "clip_g": "CLIP-G", "t5xxl": "T5-XXL", "ae": "AutoEncoder (ae)", "vae": "VAE",
+    "text_encoder": "Qwen2.5-VL text encoder", "byt5": "byT5", "gemma2": "Gemma 2", "qwen3": "Qwen3",
+}
+COMPONENT_ARGS = {"checkpoint": "pretrained_model_name_or_path"}  # every other component uses its own key as the option name
+_CACHES = {"cache_text_encoder_outputs": True, "cache_latents": True}
+# One entry per model family (the UI list in ui/model-families.mjs must name the same ids and components).
+FAMILIES = {
+    "sd15": {"label": "SD1.5", "script": "train_network.py", "modules": ("networks.lora",), "required": ("checkpoint",), "optional": (),
+             "flow": False, "fp8": "fp8_base", "swap": False, "extra": {}},
+    "sdxl": {"label": "SDXL", "script": "sdxl_train_network.py", "modules": ("networks.lora",), "required": ("checkpoint",), "optional": (),
+             "flow": False, "fp8": "fp8_base", "swap": False, "extra": {"cache_latents": True}},
+    "sd3": {"label": "SD3.5", "script": "sd3_train_network.py", "modules": ("networks.lora_sd3", "networks.lora"), "required": ("checkpoint",),
+            "optional": ("clip_l", "clip_g", "t5xxl", "vae"), "flow": True, "fp8": "fp8_base", "swap": True,
+            "extra": {"weighting_scheme": "uniform", "sdpa": True, **_CACHES}},
+    "flux": {"label": "FLUX.1", "script": "flux_train_network.py", "modules": ("networks.lora_flux",), "required": ("checkpoint", "clip_l", "t5xxl", "ae"),
+             "optional": (), "flow": True, "fp8": "fp8_base", "swap": True,
+             "extra": {"guidance_scale": 1.0, "timestep_sampling": "flux_shift", "model_prediction_type": "raw", "sdpa": True, **_CACHES}},
+    "lumina": {"label": "Lumina Image 2.0", "script": "lumina_train_network.py", "modules": ("networks.lora_lumina",), "required": ("checkpoint", "gemma2", "ae"),
+               "optional": (), "flow": True, "fp8": "fp8_base", "swap": True,
+               "extra": {"timestep_sampling": "nextdit_shift", "discrete_flow_shift": 6.0, "model_prediction_type": "raw", **_CACHES}},
+    "hunyuan": {"label": "HunyuanImage 2.1", "script": "hunyuan_image_train_network.py", "modules": ("networks.lora_hunyuan_image",),
+                "required": ("checkpoint", "text_encoder", "byt5", "vae"), "optional": (), "flow": True, "fp8": "fp8_scaled", "swap": True,
+                "extra": {"model_prediction_type": "raw", "discrete_flow_shift": 5.0, "attn_mode": "torch", "split_attn": True, **_CACHES}},
+    "anima": {"label": "Anima", "script": "anima_train_network.py", "modules": ("networks.lora_anima",), "required": ("checkpoint", "qwen3", "vae"),
+              "optional": (), "flow": True, "fp8": None, "swap": True,
+              "extra": {"timestep_sampling": "sigmoid", "discrete_flow_shift": 1.0, "vae_chunk_size": 64, "vae_disable_cache": True, **_CACHES}},
+}
+
+
+def model_family(payload: dict):
+    family_id = payload.get("model_family", "sd15")
+    if not isinstance(family_id, str) or family_id not in FAMILIES:
+        raise ValueError("model_family: choose one of " + ", ".join(FAMILIES))
+    return family_id, FAMILIES[family_id]
+
+
+def family_components(payload: dict, family: dict) -> dict:
+    """The model files of the family as paths: the required ones must exist, the optional ones only if given."""
+    found = {}
+    for key in family["required"] + family["optional"]:
+        value = payload.get(key)
+        if not isinstance(value, str) or not value.strip():
+            if key in family["required"]:
+                raise ValueError(f"{key}: choose the {COMPONENT_LABELS[key]} file for {family['label']}")
+            continue
+        path = local_path(payload, key, "file") if key != "qwen3" or not Path(value).is_dir() else local_path(payload, key)
+        if path.is_file() and path.suffix.lower() != ".safetensors":
+            raise ValueError(f"{key}: choose a .safetensors file ({COMPONENT_LABELS[key]})")
+        found[key] = path
+    return found
+
+
+def engine_args(engine: Path) -> set:
+    """Option names the installed sd-scripts knows, read from its sources (empty when they cannot be read)."""
+    known = set()
+    for folder in (engine, engine / "library", engine / "networks"):
+        for path in folder.glob("*.py"):
+            try:
+                known.update(re.findall(r"--([A-Za-z0-9_]+)", path.read_text(encoding="utf-8", errors="ignore")))
+            except OSError:
+                continue
+    return known
+
+
 def training_plan(payload: dict) -> dict:
     from PIL import Image
 
@@ -445,15 +511,16 @@ def training_plan(payload: dict) -> dict:
     use_masks = flag(payload, "use_masks", True) and not alpha_mask
     dataset = local_path(payload, "dataset_dir")
     engine = local_path(payload, "engine_dir")
-    checkpoint = local_path(payload, "checkpoint", "file")
-    tokenizer = local_path(payload, "tokenizer_dir")
-    if checkpoint.suffix.lower() != ".safetensors":
-        raise ValueError("Choose an SD1.5 .safetensors checkpoint")
-    if not (engine / "train_network.py").is_file() or not (engine / "networks" / "lora.py").is_file():
-        raise ValueError("engine_dir: set it to the root of kohya sd-scripts")
-    for name in ("vocab.json", "merges.txt", "tokenizer_config.json"):
-        if not (tokenizer / "openai_clip-vit-large-patch14" / name).is_file():
-            raise ValueError(f"Offline CLIP tokenizer is missing: {name}")
+    family_id, family = model_family(payload)
+    components = family_components(payload, family)
+    tokenizer = local_path(payload, "tokenizer_dir") if family_id == "sd15" else None
+    module = next((item for item in family["modules"] if (engine / (item.replace(".", "/") + ".py")).is_file()), None)
+    if not (engine / family["script"]).is_file() or module is None:
+        raise ValueError(f"engine_dir: set it to the root of kohya sd-scripts (a version that has {family['script']} and {family['modules'][0].replace('.', '/')}.py for {family['label']})")
+    if tokenizer is not None:
+        for name in ("vocab.json", "merges.txt", "tokenizer_config.json"):
+            if not (tokenizer / "openai_clip-vit-large-patch14" / name).is_file():
+                raise ValueError(f"Offline CLIP tokenizer is missing: {name}")
     metadata = json.loads((dataset / "metadata.json").read_text(encoding="utf-8"))
     if metadata.get("settings", {}).get("transparent") and not alpha_mask:
         raise ValueError("This dataset uses transparency. Enable All images use transparency (alpha mask).")
@@ -503,7 +570,9 @@ def training_plan(payload: dict) -> dict:
     name = text(payload, "output_name")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", name):
         raise ValueError("LoRA name must start with a letter or digit and use up to 80 letters, digits, _ or -")
-    resolution = number(payload, "resolution", 512, 256, 1024, True)
+    resolution = number(payload, "resolution", 1024 if family_id != "sd15" else 512, 256, 2048, True)
+    if resolution % 64:
+        raise ValueError("resolution: use a multiple of 64")
     rank = number(payload, "rank", 16, 1, 512, True)
     alpha = number(payload, "alpha", 16, 0.1, rank)
     batch = number(payload, "batch_size", 1, 1, 16, True)
@@ -518,9 +587,11 @@ def training_plan(payload: dict) -> dict:
     min_snr = number(payload, "min_snr_gamma", 0, 0, 20)
     noise_offset = number(payload, "noise_offset", 0, 0, 1)
     keep_tokens = number(payload, "keep_tokens", 0, 0, 10, True)
+    swap_blocks = number(payload, "blocks_to_swap", 0, 0, 60, True)
     clip_skip = choice(payload, "clip_skip", 1, (1, 2))
     shuffle = flag(payload, "shuffle_caption", False)
     checkpointing = flag(payload, "gradient_checkpointing", True)
+    fp8 = flag(payload, "fp8_base", False)
     optimizer = choice(payload, "optimizer", "AdamW", tuple(OPTIMIZER_PACKAGES))
     scheduler = choice(payload, "lr_scheduler", "constant", LR_SCHEDULERS)
     extra_args = optimizer_args(payload)
@@ -533,6 +604,18 @@ def training_plan(payload: dict) -> dict:
     warnings = []
     if optimizer in ADAPTIVE_OPTIMIZERS and learning_rate < 0.1:
         warnings.append(f"{optimizer} adapts the learning rate by itself: set Learning rate to 1 (now {learning_rate:g}).")
+    flow = family["flow"]
+    if flow:  # these models cache the text encoder outputs, so captions cannot be shuffled and only the main network is trained
+        if shuffle:
+            warnings.append(f"{family['label']} caches the text encoder outputs, so “Shuffle caption tags” is ignored.")
+        shuffle, keep_tokens = False, 0
+        ignored = [label for label, value in (("Min SNR gamma", min_snr), ("Noise offset", noise_offset), ("Clip skip", clip_skip != 1)) if value]
+        if ignored:
+            warnings.append(f"{family['label']} does not use: {', '.join(ignored)}.")
+        if text_encoder_lr > 0:
+            warnings.append(f"{family['label']} trains the main network only: the Text encoder LR is ignored.")
+        min_snr = noise_offset = text_encoder_lr = 0
+        clip_skip = 1
     quote = lambda value: json.dumps(str(value), ensure_ascii=False)
     dataset_toml = (
         f'[general]\ncaption_extension = ".txt"\nshuffle_caption = {str(shuffle).lower()}\n'
@@ -551,16 +634,15 @@ def training_plan(payload: dict) -> dict:
         if alpha_mask:
             dataset_toml += 'alpha_mask = true\n'
         dataset_toml += f'num_repeats = {repeats}\n\n'
-    config = {
-        "pretrained_model_name_or_path": checkpoint.as_posix(),
+    config = {COMPONENT_ARGS.get(key, key): path.as_posix() for key, path in components.items()}
+    config.update({
         "dataset_config": (output / "dataset.toml").as_posix(),
         "output_dir": output.as_posix(),
         "output_name": name,
-        "tokenizer_cache_dir": tokenizer.as_posix(),
-        "network_module": "networks.lora",
-        "network_dim": rank, "network_alpha": alpha,
-        "learning_rate": learning_rate,
-    }
+    })
+    if tokenizer is not None:
+        config["tokenizer_cache_dir"] = tokenizer.as_posix()
+    config.update({"network_module": module, "network_dim": rank, "network_alpha": alpha, "learning_rate": learning_rate})
     if by_epochs:
         config["max_train_epochs"] = epochs
     else:
@@ -573,11 +655,32 @@ def training_plan(payload: dict) -> dict:
         "max_data_loader_n_workers": 0,
         "save_every_n_steps": max(1, min(250, total_steps)),
     })
-    if text_encoder_lr > 0:
-        config["text_encoder_lr"] = text_encoder_lr
-        config["unet_lr"] = learning_rate
-    else:
+    known = engine_args(engine)
+    if flow or text_encoder_lr <= 0:
         config["network_train_unet_only"] = True
+    elif family_id == "sdxl":
+        if "text_encoder_lr1" in known:
+            config.update({"text_encoder_lr1": text_encoder_lr, "text_encoder_lr2": text_encoder_lr, "unet_lr": learning_rate})
+        else:
+            config.update({"text_encoder_lr": [text_encoder_lr, text_encoder_lr], "unet_lr": learning_rate})
+    else:
+        config.update({"text_encoder_lr": text_encoder_lr, "unet_lr": learning_rate})
+    config.update(family["extra"])
+    if family_id == "sdxl":
+        if precision == "fp16":
+            config["no_half_vae"] = True  # the SDXL VAE is unstable in fp16
+        if config.get("network_train_unet_only") and not shuffle:
+            config["cache_text_encoder_outputs"] = True
+    if fp8:
+        if family["fp8"]:
+            config[family["fp8"]] = True
+        else:
+            warnings.append(f"{family['label']} does not support fp8 base weights: the option is ignored.")
+    if swap_blocks:
+        if family["swap"]:
+            config["blocks_to_swap"] = swap_blocks
+        else:
+            warnings.append(f"Block swap is not available for {family['label']}: the option is ignored.")
     if extra_args:
         config["optimizer_args"] = extra_args
     warmup_steps = round(total_steps * warmup_percent / 100)
@@ -591,12 +694,17 @@ def training_plan(payload: dict) -> dict:
         config["noise_offset"] = noise_offset
     if clip_skip != 1:
         config["clip_skip"] = clip_skip
+    if "pretrained_model_name_or_path" in known:  # a readable sd-scripts: warn about options it does not have
+        unknown = sorted(key for key in config if key not in known)
+        if unknown:
+            warnings.append("This sd-scripts does not list the option(s) " + ", ".join(unknown) + ". Update sd-scripts if training stops with an argument error.")
     training_toml = "\n".join(f"{key} = {str(value).lower() if isinstance(value, bool) else json.dumps(value, ensure_ascii=False)}" for key, value in config.items()) + "\n"
     tomllib.loads(training_toml)
     tomllib.loads(dataset_toml)
     return {"output": output, "engine": engine, "dataset_toml": dataset_toml, "training_toml": training_toml,
             "samples": len(records), "left_out": left_out, "selection": selection,
-            "total_steps": total_steps, "steps_per_epoch": steps_per_epoch, "optimizer": optimizer, "warnings": warnings}
+            "total_steps": total_steps, "steps_per_epoch": steps_per_epoch, "optimizer": optimizer, "warnings": warnings,
+            "family": family_id, "label": family["label"], "script": family["script"]}
 
 
 def train(payload: dict, check_only=False) -> None:
@@ -612,15 +720,19 @@ def train(payload: dict, check_only=False) -> None:
     if problem:
         raise ValueError(problem)
     import torch
-    from transformers import CLIPTokenizer
 
     if not torch.cuda.is_available():
-        raise ValueError("SD1.5 training needs a CUDA-capable GPU and a matching PyTorch")
+        raise ValueError(f"{plan['label']} training needs a CUDA-capable GPU and a matching PyTorch")
     if payload.get("mixed_precision", "fp16") == "bf16" and not torch.cuda.is_bf16_supported():
         raise ValueError("This GPU does not support bf16. Choose fp16.")
-    CLIPTokenizer.from_pretrained(str(Path(payload["tokenizer_dir"]) / "openai_clip-vit-large-patch14"), local_files_only=True)
+    if plan["family"] == "sd15":
+        from transformers import CLIPTokenizer
+
+        CLIPTokenizer.from_pretrained(str(Path(payload["tokenizer_dir"]) / "openai_clip-vit-large-patch14"), local_files_only=True)
+    else:
+        emit(f"Note: {plan['label']} loads its tokenizers through sd-scripts; the first run may download them from Hugging Face.")
     if check_only:
-        emit(f"GPU: {torch.cuda.get_device_name(0)} / settings and local tokenizer verified")
+        emit(f"GPU: {torch.cuda.get_device_name(0)} / settings{' and local tokenizer' if plan['family'] == 'sd15' else ''} verified")
         return
     output = plan["output"]
     output.mkdir(parents=True, exist_ok=True)
@@ -629,8 +741,8 @@ def train(payload: dict, check_only=False) -> None:
     (output / "dataset.toml").write_text(plan["dataset_toml"], encoding="utf-8")
     config_path = output / "training.toml"
     config_path.write_text(plan["training_toml"], encoding="utf-8")
-    command = [sys.executable, "-u", str(plan["engine"] / "train_network.py"), "--config_file", str(config_path)]
-    emit("Starting SD1.5 LoRA training", command=command, phase="run")
+    command = [sys.executable, "-u", str(plan["engine"] / plan["script"]), "--config_file", str(config_path)]
+    emit(f"Starting {plan['label']} LoRA training", command=command, phase="run")
     result = subprocess.run(command, cwd=plan["engine"], creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     if result.returncode:
         raise RuntimeError(f"Training process stopped with exit code {result.returncode}")
@@ -662,10 +774,16 @@ def main(argv=None) -> int:
         elif kind == "dataset":
             result = create_dataset(payload)
             emit(f"Dataset saved: {result}", output=str(result))
+        elif kind == "download":
+            args.request.unlink(missing_ok=True)  # the request carries access tokens: do not leave it on disk
+            model_download.download_items(payload, emit)
         elif kind in ("train", "validate"):
             train(payload, check_only=kind == "validate")
         else:
             raise ValueError(f"Unsupported job: {kind}")
+    except model_download.DownloadError as error:
+        emit(str(error), level="error")
+        return 1
     except Exception as error:
         emit(str(error), level="error")
         return 1

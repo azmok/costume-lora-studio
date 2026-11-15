@@ -32,6 +32,7 @@
     "icon": ["icons/icon.ico", "icons/icon.png"],
     "resources": {
       "../dataset_generator.py": "backend/dataset_generator.py",
+      "../model_download.py": "backend/model_download.py",
       "../desktop_backend.py": "backend/desktop_backend.py"
     },
     "windows": {

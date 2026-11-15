@@ -2,7 +2,9 @@ import { DEFAULT_PARAMS, validateParams } from "./training-params.mjs";
 
 export const PROJECT_DEFAULTS = {
   raw_dir: "", mask_dir: "", caption_dir: "", dataset_dir: "", train_masks: "",
-  training_dir: "", trigger_word: "", checkpoint: "", output_name: "my_costume"
+  training_dir: "", trigger_word: "", checkpoint: "", output_name: "my_costume",
+  model_family: "sd15",
+  clip_l: "", clip_g: "", t5xxl: "", ae: "", vae: "", text_encoder: "", byt5: "", gemma2: "", qwen3: ""
 };
 
 export const TRAINING_DEFAULTS = { ...DEFAULT_PARAMS };

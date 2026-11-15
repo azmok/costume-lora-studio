@@ -85,6 +85,14 @@ class TransparentTests(unittest.TestCase):
         with self.assertRaises(Exception):
             generator.nonempty("\n")
 
+    def test_desktop_preparation_needs_no_mask_or_models(self):
+        output = desktop.create_dataset(dict(
+            input_dir=str(self.raw), output_dir=str(self.root / "desktop-data"),
+            models_dir=str(self.root / "absent-models"), caption_dir=str(self.raw),
+            trigger_word="costume", transparent=True,
+        ))
+        self.assertTrue((output / "metadata.json").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

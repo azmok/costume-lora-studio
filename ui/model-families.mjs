@@ -16,7 +16,7 @@ const hf = (repo, path, key, gb, extra = {}) => ({ key, repo, path, name: path.s
 // `base` = the kohya "clothing" starting values for the family (overlaid on the SD1.5 recommended preset).
 export const FAMILIES = [
   {
-    id: "sd15", label: "Stable Diffusion 1.5", civitai: ["SD 1.5"], flow: false, resolution: 512,
+    id: "sd15", short: "SD1.5", label: "Stable Diffusion 1.5", civitai: ["SD 1.5"], flow: false, fp8: true, swap: false, resolution: 512,
     components: [{ key: "checkpoint", label: "SD1.5 base model (.safetensors)", required: true }],
     base: {},
     downloads: [
@@ -24,7 +24,7 @@ export const FAMILIES = [
     ]
   },
   {
-    id: "sdxl", label: "SDXL 1.0 (also Pony / Illustrious / NoobAI)", civitai: ["SDXL", "Pony", "Illustrious", "NoobAI"], flow: false, resolution: 1024,
+    id: "sdxl", short: "SDXL", label: "SDXL 1.0 (also Pony / Illustrious / NoobAI)", civitai: ["SDXL", "Pony", "Illustrious", "NoobAI"], flow: false, fp8: true, swap: false, resolution: 1024,
     components: [{ key: "checkpoint", label: "SDXL base model (.safetensors)", required: true }],
     base: { resolution: 1024, batch_size: 1, mixed_precision: "bf16", text_encoder_lr: 0, rank: 32, alpha: 16 },
     downloads: [
@@ -32,12 +32,13 @@ export const FAMILIES = [
     ]
   },
   {
-    id: "sd3", label: "Stable Diffusion 3.5", civitai: ["SD 3"], flow: true, resolution: 1024,
+    id: "sd3", short: "SD3.5", label: "Stable Diffusion 3.5", civitai: ["SD 3"], flow: true, fp8: true, swap: true, resolution: 1024,
     components: [
       { key: "checkpoint", label: "SD3.5 model (.safetensors)", required: true },
       { key: "clip_l", label: "CLIP-L", required: false, hint: "Leave the three text encoders empty only if your model file already contains them." },
       { key: "clip_g", label: "CLIP-G", required: false },
-      { key: "t5xxl", label: "T5-XXL", required: false }
+      { key: "t5xxl", label: "T5-XXL", required: false },
+      { key: "vae", label: "VAE (optional)", required: false }
     ],
     base: { resolution: 1024, batch_size: 1, mixed_precision: "bf16", rank: 16, alpha: 16, repeats: 8, epochs: 10 },
     downloads: [
@@ -53,7 +54,7 @@ export const FAMILIES = [
     ]
   },
   {
-    id: "flux", label: "FLUX.1", civitai: ["Flux"], flow: true, resolution: 1024,
+    id: "flux", short: "FLUX.1", label: "FLUX.1", civitai: ["Flux"], flow: true, fp8: true, swap: true, resolution: 1024,
     components: [
       { key: "checkpoint", label: "FLUX.1 model (.safetensors)", required: true },
       { key: "clip_l", label: "CLIP-L", required: true },
@@ -83,7 +84,7 @@ export const FAMILIES = [
     ]
   },
   {
-    id: "lumina", label: "Lumina Image 2.0", civitai: ["Lumina"], flow: true, resolution: 1024,
+    id: "lumina", short: "Lumina 2", label: "Lumina Image 2.0", civitai: ["Lumina"], flow: true, fp8: true, swap: true, resolution: 1024,
     components: [
       { key: "checkpoint", label: "Lumina Image 2.0 model (.safetensors)", required: true },
       { key: "gemma2", label: "Gemma 2 text encoder", required: true },
@@ -102,7 +103,7 @@ export const FAMILIES = [
     ]
   },
   {
-    id: "hunyuan", label: "HunyuanImage 2.1", civitai: ["Hunyuan"], flow: true, resolution: 1024,
+    id: "hunyuan", short: "HunyuanImage 2.1", label: "HunyuanImage 2.1", civitai: ["Hunyuan"], flow: true, fp8: true, swap: true, resolution: 1024,
     components: [
       { key: "checkpoint", label: "HunyuanImage 2.1 DiT (.safetensors)", required: true },
       { key: "text_encoder", label: "Qwen2.5-VL text encoder", required: true },
@@ -123,7 +124,7 @@ export const FAMILIES = [
     ]
   },
   {
-    id: "anima", label: "Anima", civitai: ["Anima"], flow: true, resolution: 1024,
+    id: "anima", short: "Anima", label: "Anima", civitai: ["Anima"], flow: true, fp8: false, swap: true, resolution: 1024,
     components: [
       { key: "checkpoint", label: "Anima DiT (.safetensors)", required: true },
       { key: "qwen3", label: "Qwen3-0.6B text encoder", required: true },
@@ -224,4 +225,12 @@ export function presetsFor(familyId) {
 
 export function presetById(familyId, id) {
   return presetsFor(familyId).find((item) => item.id === id) ?? null;
+}
+
+// What the "link" box accepts: a Civitai model ID, a Civitai / Hugging Face link. Hugging Face "blob" pages become file links.
+export function normalizeDownloadLink(text) {
+  const value = String(text ?? "").trim();
+  if (/^\d{1,9}$/.test(value)) return "https://civitai.com/models/" + value;
+  if (!/^https:\/\//i.test(value)) throw new Error("Enter an https:// link or a Civitai model ID");
+  return value.replace(/^(https:\/\/huggingface\.co\/[^/]+\/[^/]+)\/blob\//i, "$1/resolve/");
 }

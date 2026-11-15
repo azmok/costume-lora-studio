@@ -234,6 +234,7 @@ fn start_job(
         "dataset",
         "train",
         "validate",
+        "download",
     ]
     .contains(&kind.as_str())
         || !payload.is_object()
