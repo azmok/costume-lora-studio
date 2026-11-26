@@ -1113,3 +1113,70 @@ class RawFolderTrainingTests(unittest.TestCase):
         self.assertEqual((out / "costume_raw.safetensors").read_bytes(), b"new-final")
         self.assertEqual((out / "keep_unrelated.txt").read_text(encoding="utf-8"), "keep")
         self.assertEqual((sample_dir / "other_lora-000001_p01.png").read_bytes(), b"keep-other-sample")
+
+    def test_live_epoch_samples_appear_during_training_and_defer_on_failure(self):
+        import threading
+        import time
+
+        (Path(self.base_payload["engine_dir"]) / "gen_img.py").touch()
+        other_ckpt = self.root / "kimchimix.safetensors"
+        other_ckpt.touch()
+        payload = {
+            **self.base_payload, "excluded_sources": ["skip_nomask.png"],
+            "save_every_n_epochs": 1, "sample_every_n_epochs": 1, "sample_checkpoint": str(other_ckpt),
+            "sample_prompt": "costume, standing", "sample_negative": "low quality",
+            "sample_lora_strength": 0.8, "sample_width": 512, "sample_height": 680,
+            "sample_steps": 18, "sample_cfg": 6.5, "sample_sampler": "dpmsolver++", "sample_clip_skip": 2, "sample_seed": 42,
+        }
+        plan = desktop.training_plan(payload)
+        out = plan["output"]
+        out.mkdir(parents=True, exist_ok=True)
+        plan["sample"]["prompts_file"].write_text(plan["sample"]["prompts_text"], encoding="utf-8")
+        sample_dir = plan["sample"]["out_dir"]
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        # Case 1: Epoch 1 saves mid-training -> live watcher generates sample BEFORE stop, post-pass skips it!
+        live_done: set[str] = set()
+        stop = threading.Event()
+        calls: list[tuple[str, bool]] = []
+
+        def gen_stub(command, **kwargs):
+            weights = Path(command[command.index("--network_weights") + 1]).name
+            is_live = kwargs.get("stdout") is desktop.subprocess.DEVNULL
+            calls.append((weights, is_live))
+            if is_live and weights == "costume_raw-000002.safetensors":
+                # Simulate temporary VRAM OOM during live sampling on epoch 2
+                return SimpleNamespace(returncode=1)
+            outdir = Path(command[command.index("--outdir") + 1])
+            Image.new("RGB", (64, 64), "white").save(outdir / "im_000001.png")
+            return SimpleNamespace(returncode=0)
+
+        with patch("desktop_backend.subprocess.run", side_effect=gen_stub), patch("desktop_backend.emit"):
+            watcher = threading.Thread(
+                target=desktop.watch_live_epoch_samples,
+                args=(plan, payload, stop, live_done, 0.02, 0.02),
+                daemon=True,
+            )
+            watcher.start()
+            (out / "costume_raw-000001.safetensors").write_bytes(b"epoch1-data")
+            (out / "costume_raw-000002.safetensors").write_bytes(b"epoch2-data")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not (
+                "costume_raw-000001" in live_done and ("costume_raw-000002.safetensors", True) in calls
+            ):
+                time.sleep(0.02)
+            # Epoch 1 sample MUST already exist in sample/ BEFORE training ends!
+            self.assertTrue((sample_dir / "costume_raw-000001_p01.png").is_file())
+            self.assertFalse((sample_dir / "costume_raw-000002_p01.png").exists())
+            stop.set()
+            watcher.join(timeout=2.0)
+            (out / "costume_raw.safetensors").write_bytes(b"final-data")
+            # Post-training pass skips epoch 1 (already done live), retries deferred epoch 2, and generates final!
+            desktop.generate_epoch_samples(plan, payload, already_done=live_done)
+
+        post_calls = [w for w, is_live in calls if not is_live]
+        self.assertEqual(post_calls, ["costume_raw-000002.safetensors", "costume_raw.safetensors"])
+        self.assertEqual(
+            sorted(p.name for p in sample_dir.glob("*.png")),
+            ["costume_raw-000001_p01.png", "costume_raw-000002_p01.png", "costume_raw_final_p01.png"],
+        )

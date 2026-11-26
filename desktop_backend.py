@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import tomllib
 
 import dataset_generator as generator
@@ -531,55 +533,138 @@ def find_sample_checkpoints(output: Path, name: str, every: int) -> list[tuple[s
     return targets
 
 
-def generate_epoch_samples(plan: dict, payload: dict) -> Path:
-    """Run sd-scripts gen_img.py for each saved epoch LoRA using the user's chosen model and LoRA strength."""
+def generate_sample_for_checkpoint(
+    plan: dict,
+    payload: dict,
+    tag: str,
+    lora_path: Path,
+    *,
+    index: int | None = None,
+    total: int | None = None,
+    live: bool = False,
+) -> bool:
+    """Run sd-scripts gen_img.py for one checkpoint and move outputs into sample/.
+    When live=True (running alongside training), failures (e.g. VRAM pressure) return False so training
+    is never interrupted and the checkpoint is retried automatically after training finishes."""
     sample = plan["sample"]
-    targets = find_sample_checkpoints(plan["output"], sample["name"], sample["every_n_epochs"])
-    if not targets:
+    out_dir = sample["out_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    precision = payload.get("mixed_precision", "fp16")
+    with tempfile.TemporaryDirectory(prefix=".sample-", dir=out_dir) as staging_dir:
+        staging = Path(staging_dir)
+        command = [
+            sys.executable, "-u", str(plan["engine"] / "gen_img.py"),
+            "--sdxl" if plan["family"] == "sdxl" else "--v1",
+            "--ckpt", str(sample["checkpoint"]),
+            "--network_module", "networks.lora",
+            "--network_weights", str(lora_path),
+            "--network_mul", f"{sample['lora_strength']:g}",
+            "--from_file", str(sample["prompts_file"]),
+            "--sampler", sample["sampler"],
+            "--clip_skip", str(sample["clip_skip"]),
+            "--outdir", str(staging),
+            "--sequential_file_name",
+            "--sdpa",
+        ]
+        if precision == "bf16":
+            command.append("--bf16")
+        elif precision == "fp16":
+            command.append("--fp16")
+            if plan["family"] == "sdxl":
+                command.append("--no_half_vae")
+        if plan["family"] == "sd15" and str(payload.get("tokenizer_dir") or "").strip():
+            command.extend(["--tokenizer_cache_dir", str(Path(payload["tokenizer_dir"]).resolve())])
+        if live:
+            emit(f"Live sample image ({tag}): {lora_path.name}")
+        else:
+            emit(f"Sample image ({tag}): {lora_path.name}", current=(index - 1) if index is not None else 0, total=total or 1, phase="run")
+        run_kwargs = {
+            "cwd": plan["engine"],
+            "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        }
+        if live:
+            run_kwargs.update({"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL})
+        else:
+            run_kwargs.update({"stdout": sys.stdout, "stderr": sys.stderr})
+        result = subprocess.run(command, **run_kwargs)
+        if result.returncode:
+            if live:
+                emit(f"Deferred live sample for {lora_path.name} (exit code {result.returncode}; will retry after training finishes)")
+                return False
+            raise RuntimeError(f"Sample generation failed for {lora_path.name} (exit code {result.returncode})")
+        generated_files = sorted(staging.glob("*.png"))
+        for image_idx, generated in enumerate(generated_files, 1):
+            target_name = f"{tag}_p{image_idx:02d}.png"
+            generated.replace(out_dir / target_name)
+    if live:
+        emit(f"Live sample saved ({tag}): {out_dir}")
+    else:
+        emit(f"Sample saved ({tag})", current=index or 1, total=total or 1, phase="run")
+    return True
+
+
+def watch_live_epoch_samples(
+    plan: dict,
+    payload: dict,
+    stop_event: threading.Event,
+    completed_tags: set[str],
+    poll_interval: float = 2.0,
+    settle_delay: float = 1.0,
+) -> None:
+    """Watch the LoRA output folder during training and generate samples as soon as each epoch finishes saving."""
+    sample = plan["sample"]
+    attempted_failed: set[str] = set()
+    seen_sizes: dict[str, int] = {}
+    while not stop_event.is_set():
+        for tag, lora_path in find_sample_checkpoints(plan["output"], sample["name"], sample["every_n_epochs"]):
+            if stop_event.is_set():
+                return
+            if tag in completed_tags or tag in attempted_failed or tag == f"{sample['name']}_final":
+                continue
+            try:
+                size_now = lora_path.stat().st_size
+            except OSError:
+                continue
+            if size_now <= 0:
+                continue
+            if seen_sizes.get(tag) != size_now:
+                seen_sizes[tag] = size_now
+                if settle_delay > 0:
+                    stop_event.wait(settle_delay)
+                    if stop_event.is_set():
+                        return
+                    try:
+                        if lora_path.stat().st_size != size_now:
+                            seen_sizes[tag] = lora_path.stat().st_size
+                            continue
+                    except OSError:
+                        continue
+            if generate_sample_for_checkpoint(plan, payload, tag, lora_path, live=True):
+                completed_tags.add(tag)
+            else:
+                attempted_failed.add(tag)
+        stop_event.wait(poll_interval)
+
+
+def generate_epoch_samples(plan: dict, payload: dict, already_done: set[str] | None = None) -> Path:
+    """Run sd-scripts gen_img.py for each saved epoch LoRA not yet generated live during training."""
+    sample = plan["sample"]
+    done = set(already_done or ())
+    all_targets = find_sample_checkpoints(plan["output"], sample["name"], sample["every_n_epochs"])
+    if not all_targets:
         emit("Warning: no saved LoRA files found for sample generation")
+        return sample["out_dir"]
+    targets = [(tag, path) for tag, path in all_targets if tag not in done]
+    if not targets:
+        emit(f"All sample images already generated live during training: {sample['out_dir']}")
         return sample["out_dir"]
     sample["prompts_file"].write_text(sample["prompts_text"], encoding="utf-8")
     out_dir = sample["out_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
-    precision = payload.get("mixed_precision", "fp16")
     emit(f"Generating sample images for {len(targets)} checkpoint(s) with {sample['checkpoint'].name} (strength {sample['lora_strength']:g})",
          phase="run", current=0, total=len(targets))
     for index, (tag, lora_path) in enumerate(targets, 1):
-        with tempfile.TemporaryDirectory(prefix=".sample-", dir=out_dir) as staging_dir:
-            staging = Path(staging_dir)
-            command = [
-                sys.executable, "-u", str(plan["engine"] / "gen_img.py"),
-                "--sdxl" if plan["family"] == "sdxl" else "--v1",
-                "--ckpt", str(sample["checkpoint"]),
-                "--network_module", "networks.lora",
-                "--network_weights", str(lora_path),
-                "--network_mul", f"{sample['lora_strength']:g}",
-                "--from_file", str(sample["prompts_file"]),
-                "--sampler", sample["sampler"],
-                "--clip_skip", str(sample["clip_skip"]),
-                "--outdir", str(staging),
-                "--sequential_file_name",
-                "--sdpa",
-            ]
-            if precision == "bf16":
-                command.append("--bf16")
-            elif precision == "fp16":
-                command.append("--fp16")
-                if plan["family"] == "sdxl":
-                    command.append("--no_half_vae")
-            if plan["family"] == "sd15" and str(payload.get("tokenizer_dir") or "").strip():
-                command.extend(["--tokenizer_cache_dir", str(Path(payload["tokenizer_dir"]).resolve())])
-            emit(f"Sample image ({tag}): {lora_path.name}", current=index - 1, total=len(targets), phase="run")
-            result = subprocess.run(
-                command, cwd=plan["engine"], stdout=sys.stdout, stderr=sys.stderr,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            )
-            if result.returncode:
-                raise RuntimeError(f"Sample generation failed for {lora_path.name} (exit code {result.returncode})")
-            for image_idx, generated in enumerate(sorted(staging.glob("*.png")), 1):
-                target_name = f"{tag}_p{image_idx:02d}.png"
-                shutil.move(str(generated), str(out_dir / target_name))
-        emit(f"Sample saved ({tag})", current=index, total=len(targets), phase="run")
+        generate_sample_for_checkpoint(plan, payload, tag, lora_path, index=index, total=len(targets), live=False)
     emit(f"Sample images saved: {out_dir}")
     return out_dir
 
@@ -978,19 +1063,36 @@ def train(payload: dict, check_only=False) -> None:
     (output / "dataset.toml").write_text(plan["dataset_toml"], encoding="utf-8")
     config_path = output / "training.toml"
     config_path.write_text(plan["training_toml"], encoding="utf-8")
-    if plan["sample"] and plan["sample"]["mode"] == "native":
+    if plan["sample"]:
         plan["sample"]["prompts_file"].write_text(plan["sample"]["prompts_text"], encoding="utf-8")
+        if plan["sample"]["mode"] == "gen_img":
+            plan["sample"]["out_dir"].mkdir(parents=True, exist_ok=True)
     command = [sys.executable, "-u", str(plan["engine"] / plan["script"]), "--config_file", str(config_path)]
     emit(f"Starting {plan['label']} LoRA training", command=command, phase="run")
-    # Explicit stdout/stderr is required on Windows with CREATE_NO_WINDOW, otherwise inherited pipes are detached and all logs/tqdm output disappear.
-    result = subprocess.run(command, cwd=plan["engine"], stdout=sys.stdout, stderr=sys.stderr, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    live_done: set[str] = set()
+    stop_watcher = threading.Event()
+    watcher = None
+    if plan["sample"] and plan["sample"]["mode"] == "gen_img":
+        watcher = threading.Thread(
+            target=watch_live_epoch_samples,
+            args=(plan, payload, stop_watcher, live_done),
+            daemon=True,
+        )
+        watcher.start()
+    try:
+        # Explicit stdout/stderr is required on Windows with CREATE_NO_WINDOW, otherwise inherited pipes are detached and all logs/tqdm output disappear.
+        result = subprocess.run(command, cwd=plan["engine"], stdout=sys.stdout, stderr=sys.stderr, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    finally:
+        stop_watcher.set()
+        if watcher is not None:
+            watcher.join()
     if result.returncode:
         raise RuntimeError(f"Training process stopped with exit code {result.returncode}")
     if not (output / (payload["output_name"].strip() + ".safetensors")).is_file():
         raise RuntimeError("The training process ended but the final LoRA file was not found")
     emit(f"LoRA saved: {output}")
     if plan["sample"] and plan["sample"]["mode"] == "gen_img":
-        generate_epoch_samples(plan, payload)
+        generate_epoch_samples(plan, payload, already_done=live_done)
     lora_root = str(payload.get("lora_output_dir") or "").strip()
     if lora_root:
         try:
