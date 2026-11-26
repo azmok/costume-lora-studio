@@ -436,6 +436,71 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "guide_mask"):
             desktop.mask_image({**payload, "guide_mask": "not-a-data-url"}, GuideSegmenter)
 
+    def test_generate_masks_subset_and_overwrite(self):
+        Image.new("RGB", (256, 128), "green").save(self.raw / "b.png")
+        Image.new("RGB", (256, 128), "blue").save(self.raw / "c.png")
+        calls = []
+
+        def make_segmenter(box):
+            class Segmenter:
+                def __init__(self, args):
+                    pass
+
+                def segment(self, image):
+                    calls.append(box)
+                    mask = Image.new("L", image.size, 0)
+                    mask.paste(255, box)
+                    return mask
+            return Segmenter
+
+        masks_dir = self.root / "masks"
+        base_payload = {
+            "input_dir": str(self.raw),
+            "output_dir": str(masks_dir),
+            "models_dir": str(self.root / "models"),
+            "mask_prompt": "clothes",
+            "exclude_prompt": "",
+        }
+        # 1. Subset only: sample.png + b.png
+        with patch("desktop_backend.emit"):
+            desktop.generate_masks({**base_payload, "image_paths": [str(self.raw / "sample.png"), str(self.raw / "b.png")]}, make_segmenter((64, 32, 192, 96)))
+        self.assertTrue((masks_dir / "sample.png").is_file())
+        self.assertTrue((masks_dir / "b.png").is_file())
+        self.assertFalse((masks_dir / "c.png").is_file())
+        self.assertEqual(len(calls), 2)
+
+        # Mark b.png mask with a distinctive corner pixel so we can verify skip vs overwrite
+        custom_b = Image.new("L", (256, 128), 0)
+        custom_b.paste(255, (0, 0, 80, 80))
+        custom_b.save(masks_dir / "b.png")
+
+        # 2. overwrite=False skips b.png, creates c.png
+        calls.clear()
+        with patch("desktop_backend.emit"):
+            desktop.generate_masks({**base_payload, "image_paths": [str(self.raw / "b.png"), str(self.raw / "c.png")], "overwrite": False}, make_segmenter((64, 32, 192, 96)))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue((masks_dir / "c.png").is_file())
+        self.assertEqual(Image.open(masks_dir / "b.png").getpixel((5, 5)), 255)
+
+        # 3. overwrite=True replaces ONLY b.png and preserves sample.png + c.png + metadata
+        calls.clear()
+        with patch("desktop_backend.emit"):
+            desktop.generate_masks({**base_payload, "image_paths": [str(self.raw / "b.png")], "overwrite": True}, make_segmenter((100, 32, 220, 96)))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(Image.open(masks_dir / "b.png").getpixel((5, 5)), 0)
+        self.assertEqual(Image.open(masks_dir / "b.png").getpixel((150, 64)), 255)
+        self.assertEqual(Image.open(masks_dir / "sample.png").getpixel((70, 40)), 255)
+        meta = json.loads((masks_dir / "mask_metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(item["source"] for item in meta["images"]), ["b.png", "c.png", "sample.png"])
+
+        # 4. Validation errors: empty subset, outside-source path, non-bool overwrite
+        with self.assertRaises(ValueError):
+            desktop.generate_masks({**base_payload, "image_paths": []}, make_segmenter((64, 32, 192, 96)))
+        with self.assertRaises(ValueError):
+            desktop.generate_masks({**base_payload, "image_paths": [str(self.root / "outside.png")]}, make_segmenter((64, 32, 192, 96)))
+        with self.assertRaises(ValueError):
+            desktop.generate_masks({**base_payload, "overwrite": "yes"}, make_segmenter((64, 32, 192, 96)))
+
     def test_training_plan_masked_loss_and_offline_tokenizer(self):
         payload = self.training_payload()
         plan = desktop.training_plan(payload)

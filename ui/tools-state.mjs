@@ -1,8 +1,16 @@
 export function imagePoint(rect, width, height, clientX, clientY) {
+  const raw = imagePointUnclamped(rect, width, height, clientX, clientY);
+  return {
+    x: Math.max(0, Math.min(width - 1, raw.x)),
+    y: Math.max(0, Math.min(height - 1, raw.y))
+  };
+}
+
+export function imagePointUnclamped(rect, width, height, clientX, clientY) {
   if (!rect.width || !rect.height || width < 1 || height < 1) throw new Error("Invalid image display size");
   return {
-    x: Math.max(0, Math.min(width - 1, (clientX - rect.left) * width / rect.width)),
-    y: Math.max(0, Math.min(height - 1, (clientY - rect.top) * height / rect.height))
+    x: (clientX - rect.left) * width / rect.width,
+    y: (clientY - rect.top) * height / rect.height
   };
 }
 

@@ -13,6 +13,7 @@ import { PROJECTS_KEY, createProject, deleteProject, newStore, readStore, rename
 import { getMaskColor, hexToRgb, setMaskColor } from "./mask-color.mjs";
 import { readPageZoom, stepPageZoom } from "./page-zoom.mjs";
 import { clampLogWidth, DEFAULT_LOG_WIDTH, LOG_WIDTH_KEY, parseTheme, THEME_KEY } from "./theme.mjs";
+import { initToolsLayout } from "./tools-layout.mjs";
 import { BUILTIN_MASK_PRESETS, DEFAULT_MASK_PRESET, MASK_PRESET_KEY, findMaskPreset, normalizeMaskPresetName, readMaskPresetStore, removeMaskPreset, serializeMaskPresetStore, upsertMaskPreset } from "./mask-presets.mjs";
 
 const byId = (id) => document.getElementById(id);
@@ -1114,7 +1115,7 @@ byId("log-dock-close").addEventListener("click", () => setLogDockHidden(true));
 byId("log-dock-open").addEventListener("click", () => setLogDockHidden(false));
 try { if (localStorage.getItem(LOG_DOCK_KEY) === "1") setLogDockHidden(true); } catch { /* storage unavailable */ }
 
-// ---- Appearance: 4 themes (Neumorphism / Glassmorphism × Light / Dark) ----
+// ---- Appearance: surface style and color mode ----
 let uiTheme = parseTheme((() => { try { return localStorage.getItem(THEME_KEY); } catch { return null; } })());
 function applyTheme(next) {
   uiTheme = parseTheme(next);
@@ -1130,17 +1131,22 @@ document.querySelectorAll("[data-theme-mode]").forEach((btn) => btn.addEventList
 applyTheme(uiTheme);
 
 // ---- Draggable splitter between settings workspace and right log dock ----
+let preferredLogWidth = DEFAULT_LOG_WIDTH;
 let logDockWidth = DEFAULT_LOG_WIDTH;
 function applyLogWidth(width, persist = true) {
   logDockWidth = clampLogWidth(width, window.innerWidth);
   document.documentElement.style.setProperty("--log-width", logDockWidth + "px");
-  if (persist) { try { localStorage.setItem(LOG_WIDTH_KEY, String(logDockWidth)); } catch { /* storage unavailable */ } }
+  if (persist) {
+    preferredLogWidth = logDockWidth;
+    try { localStorage.setItem(LOG_WIDTH_KEY, String(preferredLogWidth)); } catch { /* storage unavailable */ }
+  }
 }
 try {
   const storedWidth = localStorage.getItem(LOG_WIDTH_KEY);
-  if (storedWidth) applyLogWidth(Number(storedWidth), false);
+  if (storedWidth && Number.isFinite(Number(storedWidth))) preferredLogWidth = Number(storedWidth);
 } catch { /* storage unavailable */ }
-window.addEventListener("resize", () => applyLogWidth(logDockWidth, false));
+applyLogWidth(preferredLogWidth, false);
+window.addEventListener("resize", () => applyLogWidth(preferredLogWidth, false));
 
 const logResizer = byId("log-resizer");
 let dragState = null;
@@ -1470,6 +1476,7 @@ async function init() {
   }
 }
 const toolEditor = createTools({ invoke, run, notice, getProject: () => project, getJob: () => job });
+initToolsLayout(byId("tools-workspace"));
 // ---------- projects: everything you enter is autosaved and restored ----------
 const SNAPSHOT_SKIP = new Set(["model-family", "download-source", "download-url", "image-choice", "tools-zoom", "tools-caption-text", "tools-check-tagfilter"]);
 function trackedControls() {

@@ -100,8 +100,24 @@ def generate_masks(payload: dict, segmenter_factory=None) -> Path:
     if not isinstance(raw_exclude, str) or "\x00" in raw_exclude:
         raise ValueError("exclude_prompt: invalid text")
     args.exclude_prompt = raw_exclude.strip()
-    # An existing mask folder is allowed: masks that already exist are never overwritten, only skipped.
+    overwrite = payload.get("overwrite", False)
+    if not isinstance(overwrite, bool):
+        raise ValueError("overwrite must be true or false")
+    # An existing mask folder is allowed: existing masks are skipped unless overwrite=true.
     paths = generator.validate_inputs(args, allow_existing_output=True)
+    subset = payload.get("image_paths")
+    if subset is not None:
+        if not isinstance(subset, list) or not subset or not all(isinstance(item, str) and item.strip() and "\x00" not in item for item in subset):
+            raise ValueError("image_paths: provide a list of image paths")
+        known = set(paths)
+        chosen = []
+        for item in subset:
+            path = Path(item).resolve()
+            if path not in known:
+                raise ValueError("The selected image is outside the source folder")
+            if path not in chosen:
+                chosen.append(path)
+        paths = chosen
     if segmenter_factory is None:
         emit("Checking model files…", phase="check")
         generator.require_snapshot(args.dino_model_dir, download=True)
@@ -118,7 +134,7 @@ def generate_masks(payload: dict, segmenter_factory=None) -> Path:
         existing = []
         for current, path in enumerate(paths, 1):
             relative = path.relative_to(source)
-            if (destination / relative.with_suffix(".png")).is_file():
+            if not overwrite and (destination / relative.with_suffix(".png")).is_file():
                 existing.append(relative.as_posix())
                 emit(f"[SKIP] {relative.as_posix()}: a mask with the same name already exists", current=current, total=len(paths))
                 continue
@@ -156,12 +172,12 @@ def generate_masks(payload: dict, segmenter_factory=None) -> Path:
             (staging / "mask_metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             staging.rename(destination)
             return destination
-        # Merge into the existing folder without ever replacing a file.
+        # Merge into the existing folder; only overwrite target files when overwrite=true.
         for record in records:
             target = destination / record["mask"]
-            if not target.exists():
+            if overwrite or not target.exists():
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(staging / record["mask"]), str(target))
+                (staging / record["mask"]).replace(target)
         metadata_path = destination / "mask_metadata.json"
         try:
             previous = json.loads(metadata_path.read_text(encoding="utf-8"))

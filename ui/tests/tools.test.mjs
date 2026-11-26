@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { imagePoint, MaskHistory } from "../tools-state.mjs";
+import { imagePoint, imagePointUnclamped, MaskHistory } from "../tools-state.mjs";
 
 test("paint coordinates remain in source pixels when fitted or zoomed", () => {
   assert.deepEqual(imagePoint({ left: 10, top: 20, width: 200, height: 100 }, 1000, 500, 110, 70), { x: 500, y: 250 });
   assert.deepEqual(imagePoint({ left: 0, top: 0, width: 2000, height: 1000 }, 1000, 500, 1000, 500), { x: 500, y: 250 });
   assert.deepEqual(imagePoint({ left: 10, top: 20, width: 200, height: 100 }, 1000, 500, -100, 5000), { x: 0, y: 499 });
+  assert.deepEqual(imagePointUnclamped({ left: 10, top: 20, width: 200, height: 100 }, 1000, 500, 0, 130), { x: -50, y: 550 });
 });
 
 test("mask history undoes, redoes and discards stale redo states", () => {

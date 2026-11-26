@@ -1,9 +1,9 @@
-// Theme (style: neu | glass, mode: light | dark) and log-dock width clamping. Pure functions, no DOM.
+// Theme preferences and log-dock sizing.
 export const THEME_KEY = "costume-ui-theme";
 export const LOG_WIDTH_KEY = "costume-log-width";
-export const STYLES = ["neu", "glass"];
+export const STYLES = ["studio", "neu", "glass"];
 export const MODES = ["light", "dark"];
-export const DEFAULT_THEME = { style: "neu", mode: "light" };
+export const DEFAULT_THEME = { style: "studio", mode: "light" };
 export const DEFAULT_LOG_WIDTH = 400;
 export const MIN_LOG_WIDTH = 260;
 

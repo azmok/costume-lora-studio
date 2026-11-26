@@ -1,11 +1,12 @@
 import { required } from "./state.mjs";
-import { imagePoint, MaskHistory } from "./tools-state.mjs";
+import { imagePoint, imagePointUnclamped, MaskHistory } from "./tools-state.mjs";
 import { createDraftStore } from "./tools-drafts.mjs";
 import { createFullscreen } from "./fullscreen.mjs";
 import { getMaskColor, hexToRgb, setMaskColor } from "./mask-color.mjs";
 import { coverage as maskCoverage, fillHoles, growMask, invertMask, removeSpecks, shrinkMask } from "./mask-ops.mjs";
 import { ISSUE_LABELS, classify, laplacianVariance, tagFrequency, toGray } from "./dataset-check.mjs";
 import { getRecord, loadSelectionStore, saveSelectionStore, setRecord } from "./training-selection.mjs";
+import { filterUnlocked, getLocks, loadLockStore, saveLockStore, setLocksForRoot } from "./tools-locks.mjs";
 import { dedupeTags, hasTag, normalizeCaption, removeTag, BUILTIN_TEMPLATES, NO_TEMPLATE, insertTags, normalizeTemplateName, readTemplateStore, removeTemplate, serializeTemplateStore, splitTags, upsertTemplate } from "./tools-captions.mjs";
 import { BUILTIN_MASK_PRESETS, DEFAULT_MASK_PRESET, MASK_PRESET_KEY, findMaskPreset, normalizeMaskPresetName, readMaskPresetStore, removeMaskPreset, serializeMaskPresetStore, upsertMaskPreset } from "./mask-presets.mjs";
 
@@ -40,6 +41,9 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   let lastBulk = null; // { label, before: Map(relative -> caption) } for "Undo last bulk edit"
   let trainingStore = {}; // which images LoRA training uses, per source folder (unchecked = left out)
   const excludedTraining = new Set();
+  let lockStore = {}; // per-folder caption / mask locks (protected from AI auto-generation & batch overwrite)
+  const captionLocks = new Set();
+  const maskLocks = new Set();
   let editRev = 0; // bumps on every edit, so a save in progress never clears the "unsaved" flag of newer edits
   let autosaveTimer = 0;
   let reviewed = new Set();
@@ -67,6 +71,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     document.querySelectorAll("#page-tools [data-tool-lock]").forEach((control) => { control.disabled = locked; });
     document.querySelectorAll("#page-tools .tool-image-action").forEach((button) => { button.disabled = locked || !current(); });
     byId("tools-caption-all").disabled = locked || entries.length === 0;
+    byId("tools-mask-all").disabled = locked || entries.length === 0;
     byId("tools-fullscreen").hidden = canvas.hidden;
     byId("tools-fs-info").textContent = current() ? current().relative + (maskDirty || captionDirty ? "  ●" : "") : "";
     const visible = visibleIndexes();
@@ -76,6 +81,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     byId("tools-train-toggle").disabled = locked || !current();
     for (const id of ["tools-train-all", "tools-train-none", "tools-train-invert", "tools-train-highlighted"]) byId(id).disabled = locked || entries.length === 0;
     document.querySelectorAll(".train-check").forEach((box) => { box.disabled = locked; });
+    document.querySelectorAll(".lock-btn").forEach((button) => { button.disabled = locked; });
     byId("tools-reviewed").setAttribute("aria-pressed", String(Boolean(current() && reviewed.has(current().relative))));
     byId("tools-prev").disabled = locked || position <= 0;
     byId("tools-next").disabled = locked || visible.length === 0 || position >= visible.length - 1;
@@ -92,16 +98,19 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     const unsaved = entries.filter((entry) => entry.draft).length;
     byId("tools-save-all").textContent = unsaved ? "Save all changes (" + unsaved + (unsaved === 1 ? " image)" : " images)") : "Save all changes";
     byId("tools-save-all").disabled = locked || unsaved === 0;
-    document.querySelectorAll(".tool-image-item").forEach((button, index) => {
+    document.querySelectorAll(".tool-image-item").forEach((button) => {
+      const idx = Number(button.dataset.index);
       button.disabled = locked;
-      button.classList.toggle("has-draft", Boolean(entries[index]?.draft));
-      button.classList.toggle("multi-selected", checked.has(index));
-      button.classList.toggle("reviewed", reviewed.has(entries[index]?.relative));
+      button.classList.toggle("has-draft", Boolean(entries[idx]?.draft));
+      button.classList.toggle("multi-selected", checked.has(idx));
+      button.classList.toggle("reviewed", reviewed.has(entries[idx]?.relative));
     });
     byId("tools-tags-selected").textContent = "Insert into selected images (" + checked.size + (checked.size === 1 ? " image)" : " images)");
     byId("tools-tags-selected").disabled = locked || checked.size === 0;
     byId("tools-caption-selected").textContent = "Generate captions for selected images (" + checked.size + (checked.size === 1 ? " image)" : " images)");
     byId("tools-caption-selected").disabled = locked || checked.size === 0 || !current();
+    byId("tools-mask-selected").textContent = "Auto mask for selected images (" + checked.size + (checked.size === 1 ? " image)" : " images)");
+    byId("tools-mask-selected").disabled = locked || checked.size === 0;
     byId("tools-tags-all").disabled = locked || entries.length === 0;
   }
 
@@ -283,16 +292,54 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     if (entry) setTrainingUse([entry.relative], excludedTraining.has(entry.relative));
   }
 
+  // ---- per-image caption (C) and mask (M) locks: block AI auto-generation & batch overwrite ----
+  function persistLocks() {
+    lockStore = setLocksForRoot(lockStore, loadedRoot, { caption: [...captionLocks], mask: [...maskLocks] });
+    saveLockStore(lockStore);
+  }
+  function loadLocks() {
+    lockStore = loadLockStore();
+    const present = new Set(entries.map((entry) => entry.relative));
+    const saved = getLocks(lockStore, loadedRoot);
+    captionLocks.clear();
+    maskLocks.clear();
+    for (const name of saved.caption) if (present.has(name)) captionLocks.add(name);
+    for (const name of saved.mask) if (present.has(name)) maskLocks.add(name);
+    persistLocks();
+  }
+  function lockIconSvg(locked) {
+    return locked
+      ? '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5 7V5a3 3 0 0 1 6 0v2"/></svg>'
+      : '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5 7V5a3 3 0 0 1 5.6-1.5"/></svg>';
+  }
+  function updateLockButton(button, kind, relative, locked) {
+    button.setAttribute("aria-pressed", String(locked));
+    const label = kind === "caption" ? "Caption" : "Mask";
+    button.title = locked
+      ? label + " locked (protected from AI auto-generation & batch overwrite). Click to unlock."
+      : "Lock " + label.toLowerCase() + " (protect from AI auto-generation & batch overwrite).";
+    button.setAttribute("aria-label", (locked ? "Unlock " : "Lock ") + label.toLowerCase() + " for " + relative);
+    button.innerHTML = "<span>" + (kind === "caption" ? "C" : "M") + "</span>" + lockIconSvg(locked);
+  }
+  function toggleLock(kind, relative) {
+    if (busy() || !loadedRoot || !relative) return;
+    const targetSet = kind === "caption" ? captionLocks : maskLocks;
+    const nextLocked = !targetSet.has(relative);
+    if (nextLocked) targetSet.add(relative); else targetSet.delete(relative);
+    persistLocks();
+    for (const button of byId("tools-files").querySelectorAll('.lock-btn[data-lock-kind="' + kind + '"]')) {
+      if (button.dataset.relative === relative) updateLockButton(button, kind, relative, nextLocked);
+    }
+  }
+
   // Lazy list thumbnails: only items scrolled into view are loaded, two at a time.
   function drawThumb(image) {
-    const side = 72;
+    const scale = Math.min(1, 384 / Math.max(image.naturalWidth, image.naturalHeight));
     const surface = document.createElement("canvas");
-    surface.width = surface.height = side;
-    const scale = Math.max(side / image.naturalWidth, side / image.naturalHeight);
-    const width = image.naturalWidth * scale;
-    const height = image.naturalHeight * scale;
-    surface.getContext("2d").drawImage(image, (side - width) / 2, (side - height) / 2, width, height);
-    return surface.toDataURL("image/jpeg", 0.7);
+    surface.width = Math.max(1, Math.round(image.naturalWidth * scale));
+    surface.height = Math.max(1, Math.round(image.naturalHeight * scale));
+    surface.getContext("2d").drawImage(image, 0, 0, surface.width, surface.height);
+    return surface.toDataURL("image/webp", 0.78);
   }
   function applyThumb(entry) {
     const url = thumbCache.get(entry.image);
@@ -388,7 +435,22 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
           selectImage(index).catch(notice);
         }
       });
-      row.append(useBox, button);
+      const locksBox = document.createElement("div");
+      locksBox.className = "row-locks";
+      for (const kind of ["caption", "mask"]) {
+        const lockBtn = document.createElement("button");
+        lockBtn.type = "button";
+        lockBtn.className = "lock-btn lock-" + kind;
+        lockBtn.dataset.lockKind = kind;
+        lockBtn.dataset.relative = entry.relative;
+        updateLockButton(lockBtn, kind, entry.relative, (kind === "caption" ? captionLocks : maskLocks).has(entry.relative));
+        lockBtn.addEventListener("click", (event) => {
+          event.stopPropagation();
+          toggleLock(kind, entry.relative);
+        });
+        locksBox.append(lockBtn);
+      }
+      row.append(useBox, button, locksBox);
       list.append(row);
     });
     updateControls();
@@ -448,9 +510,15 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     }
   }
 
-  async function confirmOverwrite(count) {
+  async function confirmOverwrite(count, kind = "captions", lockedCount = 0) {
     const dialog = byId("tools-overwrite-dialog");
-    byId("tools-overwrite-message").textContent = "Overwriting captions for " + count + " images: existing captions are fully replaced (cannot be undone). Captions of images outside the target are not changed.";
+    const isMasks = kind === "masks";
+    const title = byId("tools-overwrite-title");
+    if (title) title.textContent = isMasks ? "Overwrite existing masks" : "Overwrite existing captions";
+    const lockNote = lockedCount ? " (" + lockedCount + " locked " + (lockedCount === 1 ? "image" : "images") + " will be skipped.)" : "";
+    byId("tools-overwrite-message").textContent = (isMasks
+      ? "Overwriting masks for " + count + (count === 1 ? " image" : " images") + ": existing masks are fully replaced (cannot be undone). Masks of images outside the target are not changed."
+      : "Overwriting captions for " + count + (count === 1 ? " image" : " images") + ": existing captions are fully replaced (cannot be undone). Captions of images outside the target are not changed.") + lockNote;
     return new Promise((resolve) => {
       const finish = (confirmed) => {
         dialog.close();
@@ -580,6 +648,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       loadedRoot = root;
       reviewed = loadReviewed();
       loadTrainingSelection();
+      loadLocks();
       thumbCache.clear();
       thumbQueue.length = 0;
       thumbGeneration++;
@@ -782,10 +851,19 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   const baseLayer = document.createElement("canvas");
   const strokeLayer = document.createElement("canvas");
   const pointFor = (event) => {
-    const point = imagePoint(canvas.getBoundingClientRect(), canvas.width, canvas.height, event.clientX, event.clientY);
+    // Allow unclamped coordinates outside the image edge so the brush rim can smoothly paint/erase the border.
+    const point = imagePointUnclamped(canvas.getBoundingClientRect(), canvas.width, canvas.height, event.clientX, event.clientY);
     const size = Number(byId("tools-brush-size").value);
     if (brush === "box" || brush === "lasso" || size >= 3) return point;
     return { x: Math.floor(point.x) + 0.5, y: Math.floor(point.y) + 0.5 };
+  };
+  const clampGuidancePoint = (point) => ({
+    x: Math.max(0, Math.min(Math.max(0, canvas.width - 1), point.x)),
+    y: Math.max(0, Math.min(Math.max(0, canvas.height - 1), point.y))
+  });
+  const onScrollbar = (event) => {
+    const rect = scroller.getBoundingClientRect();
+    return event.clientX >= rect.left + scroller.clientWidth || event.clientY >= rect.top + scroller.clientHeight;
   };
   // Brush cursor: a ring sized to the real brush diameter on screen, filled at the brush opacity.
   const cursorRing = document.createElement("div");
@@ -798,6 +876,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   function updateBrushCursor() {
     const show = cursorAt && mode === "mask" && original && !canvas.hidden && brush !== "box" && brush !== "lasso" && !spaceDown;
     canvas.classList.toggle("brush-cursor-on", Boolean(show));
+    scroller.classList.toggle("brush-cursor-on", Boolean(show));
     cursorRing.hidden = !show;
     if (!show) return;
     const rect = canvas.getBoundingClientRect();
@@ -816,24 +895,29 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     const next = Number(Math.max(Number(input.min), Math.min(Number(input.max), Math.round(value / step) * step)).toFixed(2));
     if (String(next) !== input.value) { input.value = String(next); input.dispatchEvent(new Event("input", { bubbles: true })); }
   }
-  canvas.addEventListener("pointermove", (event) => {
+  scroller.addEventListener("pointermove", (event) => {
     if (adjust) { updateBrushCursor(); return; } // the ring stays where the right-drag started
+    if (!stroke && !pan && onScrollbar(event)) { cursorAt = null; updateBrushCursor(); return; }
     cursorAt = { x: event.clientX, y: event.clientY };
     updateBrushCursor();
   });
-  canvas.addEventListener("contextmenu", (event) => { if (mode === "mask") event.preventDefault(); });
-  canvas.addEventListener("pointerdown", (event) => {
-    if (event.button !== 2 || mode !== "mask" || !original || busy()) return;
+  scroller.addEventListener("contextmenu", (event) => { if (mode === "mask" && original && !onScrollbar(event)) event.preventDefault(); });
+  scroller.addEventListener("pointerdown", (event) => {
+    if (event.button !== 2 || mode !== "mask" || !original || busy() || onScrollbar(event)) return;
     // Right-drag: left / right = brush size. With Alt held, up / down also changes the brush opacity.
     event.preventDefault();
-    canvas.setPointerCapture(event.pointerId);
+    scroller.setPointerCapture(event.pointerId);
     adjust = { x: event.clientX, y: event.clientY, withOpacity: event.altKey, size: Number(byId("tools-brush-size").value), opacity: Number(byId("tools-brush-opacity").value) };
   });
-  canvas.addEventListener("pointerenter", (event) => { cursorAt = { x: event.clientX, y: event.clientY }; updateBrushCursor(); });
-  canvas.addEventListener("pointerleave", () => { if (!stroke) { cursorAt = null; updateBrushCursor(); } });
-  canvas.addEventListener("pointerup", (event) => {
-    const rect = canvas.getBoundingClientRect();
-    if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) { cursorAt = null; updateBrushCursor(); }
+  scroller.addEventListener("pointerenter", (event) => {
+    if (onScrollbar(event)) return;
+    cursorAt = { x: event.clientX, y: event.clientY };
+    updateBrushCursor();
+  });
+  scroller.addEventListener("pointerleave", () => { if (!stroke && !adjust && !pan) { cursorAt = null; updateBrushCursor(); } });
+  scroller.addEventListener("pointerup", (event) => {
+    const rect = scroller.getBoundingClientRect();
+    if (event.clientX < rect.left || event.clientX >= rect.left + scroller.clientWidth || event.clientY < rect.top || event.clientY >= rect.top + scroller.clientHeight) { cursorAt = null; updateBrushCursor(); }
   });
   for (const id of ["tools-brush-size", "tools-brush-opacity"]) byId(id).addEventListener("input", updateBrushCursor);
   scroller.addEventListener("scroll", updateBrushCursor);
@@ -904,19 +988,20 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     stroke.last = point;
     render();
   }
-  canvas.addEventListener("pointerdown", (event) => {
-    if (!original || busy() || event.button !== 0) return;
+  scroller.addEventListener("pointerdown", (event) => {
+    if (!original || busy() || event.button !== 0 || onScrollbar(event)) return;
     if (mode !== "mask" && !spaceDown) return;
     event.preventDefault();
     if (spaceDown) {
       // Space + drag pans the image instead of painting.
       pan = { x: event.clientX, y: event.clientY, left: scroller.scrollLeft, top: scroller.scrollTop };
-      canvas.setPointerCapture(event.pointerId);
+      scroller.setPointerCapture(event.pointerId);
       canvas.classList.add("panning");
+      scroller.classList.add("panning");
       return;
     }
     if (view === "original" || peek) { peek = false; setView(view === "original" ? "overlay" : view); }
-    canvas.setPointerCapture(event.pointerId);
+    scroller.setPointerCapture(event.pointerId);
     const shape = brush === "box" || brush === "lasso" ? brush : "brush";
     const erase = shape === "brush" ? (brush === "remove") !== event.altKey : event.altKey;
     stroke = { start: pointFor(event), last: pointFor(event), shape, erase, points: [pointFor(event)], label: erase ? 0 : 1, layered: shape !== "brush" || brushOpacity() < 1 || brushRandomness() > 0,
@@ -927,7 +1012,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     }
     drawStroke(stroke.start);
   });
-  canvas.addEventListener("pointermove", (event) => {
+  scroller.addEventListener("pointermove", (event) => {
     if (adjust) {
       setRangeValue("tools-brush-size", adjust.size * Math.exp((event.clientX - adjust.x) / 120));
       if (adjust.withOpacity) setRangeValue("tools-brush-opacity", adjust.opacity - (event.clientY - adjust.y) * 0.5); // up = denser, down = lighter
@@ -938,7 +1023,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   });
   const finishStroke = () => {
     if (adjust) { adjust = null; return; }
-    if (pan) { pan = null; canvas.classList.remove("panning"); return; }
+    if (pan) { pan = null; canvas.classList.remove("panning"); scroller.classList.remove("panning"); return; }
     if (!stroke) return;
     let center = stroke.start;
     if (stroke.shape === "box") center = { x: (stroke.start.x + stroke.last.x) / 2, y: (stroke.start.y + stroke.last.y) / 2 };
@@ -947,7 +1032,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       const ys = stroke.points.map((spot) => spot.y);
       center = { x: (Math.min(...xs) + Math.max(...xs)) / 2, y: (Math.min(...ys) + Math.max(...ys)) / 2 };
     }
-    guidance.push({ ...center, label: stroke.label });
+    guidance.push({ ...clampGuidancePoint(center), label: stroke.label });
     guidance = guidance.slice(-64);
     stroke = null;
     history.commit(bitmap(), guidance);
@@ -956,8 +1041,8 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     render();
     scheduleDraft();
   };
-  canvas.addEventListener("pointerup", finishStroke);
-  canvas.addEventListener("pointercancel", finishStroke);
+  scroller.addEventListener("pointerup", finishStroke);
+  scroller.addEventListener("pointercancel", finishStroke);
   for (const [id, action] of [["tools-undo", "undo"], ["tools-redo", "redo"]]) {
     byId(id).addEventListener("click", () => {
       if (busy()) return;
@@ -1024,6 +1109,9 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
 
   async function generateCaption(scope) {
     if (!current() || busy()) return;
+    if (scope === "one" && captionLocks.has(current().relative)) {
+      throw new Error("This image's caption is locked. Unlock C-lock to generate a caption.");
+    }
     if (scope === "one" && captionDirty && !await confirmDiscard()) return;
     const instruction = byId("tools-caption-prompt").value.trim();
     if (byId("tools-caption-model").value === "qwen2-vl" && !instruction) {
@@ -1040,13 +1128,19 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     let targets = [];
     if (scope === "one") payload.image_path = current().image;
     else {
-      targets = scope === "selected" ? [...checked].sort((a, b) => a - b).map((index) => entries[index]).filter(Boolean) : entries.slice();
+      const rawTargets = scope === "selected" ? [...checked].sort((a, b) => a - b).map((index) => entries[index]).filter(Boolean) : entries.slice();
+      const { unlocked, lockedCount } = filterUnlocked(rawTargets, captionLocks);
+      if (!unlocked.length) throw new Error("All target images have locked captions. Unlock C-lock to generate captions.");
       // Unsaved (draft) captions are protected unless overwrite is on.
-      if (!overwrite) targets = targets.filter((entry) => !entry.draft?.caption);
-      if (!targets.length) throw new Error("No images to generate. Images with unsaved captions become targets when “Overwrite existing captions” is checked.");
+      targets = overwrite ? unlocked : unlocked.filter((entry) => !entry.draft?.caption);
+      if (!targets.length) {
+        throw new Error(lockedCount
+          ? "No unlocked images to generate (" + lockedCount + " locked). Check “Overwrite existing captions” to regenerate unlocked drafts."
+          : "No images to generate. Images with unsaved captions become targets when “Overwrite existing captions” is checked.");
+      }
       payload.image_paths = targets.map((entry) => entry.image);
       payload.overwrite = overwrite;
-      if (overwrite && !await confirmOverwrite(targets.length)) return;
+      if (overwrite && !await confirmOverwrite(targets.length, "captions", lockedCount)) return;
     }
     pending = { kind: "caption", batch: scope !== "one", overwrite, targets: new Set(targets.map((entry) => entry.relative)) };
     try { await run("caption", payload); } catch (error) { pending = null; throw error; }
@@ -1062,6 +1156,8 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     if (busy() || !targets.length) return;
     const tagsText = byId("tools-extra-tags").value;
     if (!splitTags(tagsText).length) throw new Error("Enter the tags to add");
+    const { unlocked, lockedCount } = filterUnlocked(targets, captionLocks);
+    if (!unlocked.length) throw new Error("All target images have locked captions. Unlock C-lock to insert tags.");
     const trigger = String(getProject().trigger_word ?? "").trim();
     await flushDraft();
     saving = true;
@@ -1069,7 +1165,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     let changed = 0;
     const failed = [];
     try {
-      for (const entry of targets) {
+      for (const entry of unlocked) {
         try {
           const before = await captionFor(entry);
           const after = insertTags(before, trigger, tagsText);
@@ -1090,7 +1186,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
     updateControls();
     if (checkInfo.size) recomputeCheck();
     scheduleAutosave();
-    byId("tools-tags-status").textContent = label + ": inserted into " + changed + ", unchanged " + (targets.length - changed - failed.length) + (failed.length ? ", failed " + failed.length : "") + ". Write them out with “Save all changes”.";
+    byId("tools-tags-status").textContent = label + ": inserted into " + changed + ", unchanged " + (unlocked.length - changed - failed.length) + (lockedCount ? ", skipped " + lockedCount + " locked" : "") + (failed.length ? ", failed " + failed.length : "") + ". Write them out with “Save all changes”.";
     if (failed.length) throw new Error("Could not insert into: " + failed.join(" / "));
   }
   byId("tools-tags-selected").addEventListener("click", () => insertTagsInto([...checked].sort((a, b) => a - b).map((index) => entries[index]).filter(Boolean), "Selected images").catch(notice));
@@ -1166,6 +1262,9 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   byId("tools-auto-mask").addEventListener("click", async () => {
     try {
       if (!current() || busy()) return;
+      if (maskLocks.has(current().relative)) {
+        throw new Error("This image's mask is locked. Unlock M-lock to run Auto mask.");
+      }
       let hasPaintedArea = false;
       if (maskCanvas.width > 0 && maskCanvas.height > 0) {
         const pixels = maskCanvas.getContext("2d").getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
@@ -1185,6 +1284,42 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       });
     } catch (error) { pending = null; notice(error); }
   });
+
+  async function generateMasksBatch(scope) {
+    if (busy() || !entries.length) return;
+    const outputDir = required(getProject().mask_dir, "Mask output");
+    const maskPrompt = required(byId("tools-mask-prompt").value, "What to train on");
+    const excludePrompt = byId("tools-exclude-prompt").value.trim();
+    const overwrite = byId("tools-mask-overwrite").checked;
+    const rawTargets = scope === "selected"
+      ? [...checked].sort((a, b) => a - b).map((index) => entries[index]).filter(Boolean)
+      : entries.slice();
+    if (!rawTargets.length) return;
+    const { unlocked, lockedCount } = filterUnlocked(rawTargets, maskLocks);
+    if (!unlocked.length) throw new Error("All target images have locked masks. Unlock M-lock to run Auto mask.");
+    const targets = overwrite ? unlocked : unlocked.filter((entry) => !entry.mask && !entry.draft?.mask);
+    if (!targets.length) {
+      throw new Error(lockedCount
+        ? "No unlocked images without masks to generate (" + lockedCount + " locked). Check “Overwrite existing masks” to regenerate unlocked masks."
+        : "No images without masks to generate. Check “Overwrite existing masks” to regenerate existing masks.");
+    }
+    if (overwrite && !await confirmOverwrite(targets.length, "masks", lockedCount)) return;
+    await flushDraft();
+    pending = { kind: "mask", batch: true, overwrite, targets: new Set(targets.map((entry) => entry.relative)) };
+    try {
+      await run("mask", {
+        input_dir: loadedRoot,
+        output_dir: outputDir,
+        mask_prompt: maskPrompt,
+        exclude_prompt: excludePrompt,
+        image_paths: targets.map((entry) => entry.image),
+        overwrite,
+        device: byId("mask-device").value
+      });
+    } catch (error) { pending = null; throw error; }
+  }
+  byId("tools-mask-selected").addEventListener("click", () => generateMasksBatch("selected").catch(notice));
+  byId("tools-mask-all").addEventListener("click", () => generateMasksBatch("all").catch(notice));
 
   async function save(kind) {
     if (!current() || busy()) return;
@@ -1736,6 +1871,8 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       anchor = -1;
       reviewed = new Set();
       excludedTraining.clear();
+      captionLocks.clear();
+      maskLocks.clear();
       guidance = [];
       filter = null;
       checkInfo = new Map();
@@ -1777,7 +1914,7 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
       }
       if (data.status && data.status !== "running") {
         // Only the chosen images were (re)generated; everything else is untouched.
-        if (pending?.batch && data.status === "succeeded" && current()) {
+        if (pending?.kind === "caption" && pending.batch && data.status === "succeeded" && current()) {
           const inTargets = pending.targets.has(current().relative);
           if (pending.overwrite) {
             for (const draft of await drafts.listByRoot(loadedRoot)) {
@@ -1794,6 +1931,38 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
           } else if (inTargets && !captionDirty) {
             byId("tools-caption-text").value = await invoke("load_tool_caption", { root: loadedRoot, image: current().image, captionDir: captionDir() });
           }
+        } else if (pending?.kind === "mask" && pending.batch && data.status === "succeeded" && loadedRoot) {
+          const scanned = await invoke("scan_images", { root: loadedRoot, maskRoot: getProject().mask_dir });
+          const maskByRelative = new Map(scanned.map((item) => [item.relative, item.mask]));
+          for (const entry of entries) {
+            if (!pending.targets.has(entry.relative)) continue;
+            const updatedMask = maskByRelative.get(entry.relative);
+            if (updatedMask) {
+              entry.mask = updatedMask;
+              entry.maskRev = (entry.maskRev ?? 0) + 1;
+            }
+          }
+          if (pending.overwrite) {
+            for (const draft of await drafts.listByRoot(loadedRoot)) {
+              if (!draft.mask || !pending.targets.has(draft.relative)) continue;
+              if (typeof draft.caption === "string") await drafts.put({ ...draft, mask: null, guidance: [] });
+              else await drafts.remove(loadedRoot, draft.relative);
+              const entry = entries.find((item) => item.relative === draft.relative);
+              if (entry && entry !== current()) entry.draft = typeof draft.caption === "string" ? { mask: false, caption: true } : null;
+            }
+          }
+          if (current() && pending.targets.has(current().relative) && current().mask && (pending.overwrite || !maskDirty)) {
+            loading = true;
+            updateControls();
+            try {
+              await maskFromURL(await invoke("preview_image", { path: current().mask }), false);
+              guidance = [];
+              maskDirty = false;
+              await ensureOriginal(current());
+              await flushDraft();
+            } finally { loading = false; }
+          }
+          renderFiles();
         }
         pending = null;
       }
