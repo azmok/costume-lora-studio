@@ -162,6 +162,136 @@ async fn choose_path(app: AppHandle, directory: bool) -> Result<Option<String>, 
     .map_err(|error| error.to_string())?
 }
 
+fn serialize_config(path: &Path, content: &Value) -> Result<String, String> {
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "json" {
+        serde_json::to_string_pretty(content)
+            .map(|text| format!("{text}\n"))
+            .map_err(|error| error.to_string())
+    } else {
+        serde_yaml::to_string(content).map_err(|error| error.to_string())
+    }
+}
+
+fn parse_config_text(text: &str) -> Result<Value, String> {
+    if text.trim().is_empty() {
+        return Err("Config file is empty".into());
+    }
+    serde_yaml::from_str::<Value>(text).map_err(|error| format!("Could not parse YAML / JSON: {error}"))
+}
+
+#[tauri::command]
+async fn export_config_file(
+    app: AppHandle,
+    default_name: String,
+    content: Value,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let fallback = if default_name.trim().is_empty() {
+            "lora-config.yaml".to_owned()
+        } else {
+            default_name.trim().to_owned()
+        };
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_file_name(&fallback)
+            .add_filter("YAML config", &["yaml", "yml"])
+            .add_filter("JSON config", &["json"]);
+        if let Some(presets) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|root| root.join("presets"))
+            .filter(|dir| dir.is_dir())
+        {
+            dialog = dialog.set_directory(presets);
+        }
+        let Some(picked) = dialog.blocking_save_file() else {
+            return Ok(None);
+        };
+        let mut path = picked.into_path().map_err(|error| error.to_string())?;
+        if path.extension().is_none() {
+            path.set_extension("yaml");
+        }
+        let encoded = serialize_config(&path, &content)?;
+        write_tool_file(&path, encoded.as_bytes())?;
+        Ok(Some(path.to_string_lossy().replace('\\', "/")))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn check_output_dir(path: String, output_name: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = Path::new(path.trim());
+        if path.trim().is_empty() || !dir.is_dir() {
+            return Ok(json!({"non_empty": false, "same_name": false, "files": []}));
+        }
+        let mut files: Vec<String> = Vec::new();
+        let mut same_name = false;
+        let name_lower = output_name.trim().to_ascii_lowercase();
+        let exact = format!("{name_lower}.safetensors");
+        let prefix = format!("{name_lower}-");
+        for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let item = entry.file_name().to_string_lossy().into_owned();
+            let lower = item.to_ascii_lowercase();
+            if !name_lower.is_empty()
+                && (lower == exact || (lower.starts_with(&prefix) && lower.ends_with(".safetensors")))
+            {
+                same_name = true;
+            }
+            if files.len() < 10 {
+                files.push(item);
+            }
+        }
+        Ok(json!({
+            "non_empty": !files.is_empty(),
+            "same_name": same_name,
+            "files": files
+        }))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn import_config_file(app: AppHandle) -> Result<Option<Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .add_filter("YAML / JSON config", &["yaml", "yml", "json"]);
+        if let Some(presets) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(|root| root.join("presets"))
+            .filter(|dir| dir.is_dir())
+        {
+            dialog = dialog.set_directory(presets);
+        }
+        let Some(picked) = dialog.blocking_pick_file() else {
+            return Ok(None);
+        };
+        let path = picked.into_path().map_err(|error| error.to_string())?;
+        let meta = fs::metadata(&path).map_err(|error| error.to_string())?;
+        if meta.len() > 512 * 1024 {
+            return Err("Config file is too large (max 512 KB)".into());
+        }
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let data = parse_config_text(&text)?;
+        Ok(Some(json!({
+            "path": path.to_string_lossy().replace('\\', "/"),
+            "data": data
+        })))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 fn event(app: &AppHandle, job_id: &str, data: Value) {
     let data = json!({"jobId": job_id, "data": data});
     if let Ok(mut session) = app.state::<JobState>().0.lock() {
@@ -257,11 +387,17 @@ fn start_job(
     if python.trim().is_empty() {
         return Err("Set the Python path in Environment settings".into());
     }
-    let root = resource_root(&app);
-    let mut backend = root.join("backend/desktop_backend.py");
-    if !backend.is_file() {
-        backend = Path::new(env!("CARGO_MANIFEST_DIR")).join("../desktop_backend.py");
-    }
+    let dev_backend = Path::new(env!("CARGO_MANIFEST_DIR")).join("../desktop_backend.py");
+    let backend = if cfg!(debug_assertions) && dev_backend.is_file() {
+        dev_backend
+    } else {
+        let bundled = resource_root(&app).join("backend/desktop_backend.py");
+        if bundled.is_file() {
+            bundled
+        } else {
+            dev_backend
+        }
+    };
     let id = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
@@ -752,6 +888,9 @@ fn main() {
             load_settings,
             save_settings,
             choose_path,
+            export_config_file,
+            import_config_file,
+            check_output_dir,
             start_job,
             cancel_job,
             job_status,

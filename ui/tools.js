@@ -7,6 +7,7 @@ import { coverage as maskCoverage, fillHoles, growMask, invertMask, removeSpecks
 import { ISSUE_LABELS, classify, laplacianVariance, tagFrequency, toGray } from "./dataset-check.mjs";
 import { getRecord, loadSelectionStore, saveSelectionStore, setRecord } from "./training-selection.mjs";
 import { dedupeTags, hasTag, normalizeCaption, removeTag, BUILTIN_TEMPLATES, NO_TEMPLATE, insertTags, normalizeTemplateName, readTemplateStore, removeTemplate, serializeTemplateStore, splitTags, upsertTemplate } from "./tools-captions.mjs";
+import { BUILTIN_MASK_PRESETS, DEFAULT_MASK_PRESET, MASK_PRESET_KEY, findMaskPreset, normalizeMaskPresetName, readMaskPresetStore, removeMaskPreset, serializeMaskPresetStore, upsertMaskPreset } from "./mask-presets.mjs";
 
 export function createTools({ invoke, run, notice, getProject, getJob }) {
   const byId = (id) => document.getElementById(id);
@@ -1097,16 +1098,90 @@ export function createTools({ invoke, run, notice, getProject, getJob }) {
   byId("tools-caption-one").addEventListener("click", () => generateCaption("one").catch(notice));
   byId("tools-caption-selected").addEventListener("click", () => generateCaption("selected").catch(notice));
   byId("tools-caption-all").addEventListener("click", () => generateCaption("all").catch(notice));
+  // --- Auto-mask prompt presets (shared with Mask Creation via localStorage) ---
+  {
+    const select = byId("tools-mask-preset-select");
+    const builtinGroup = byId("tools-mask-builtin-presets");
+    const customGroup = byId("tools-mask-custom-presets");
+    const nameInput = byId("tools-mask-preset-name");
+    const saveBtn = byId("tools-mask-preset-save");
+    const deleteBtn = byId("tools-mask-preset-delete");
+    const statusEl = byId("tools-mask-preset-status");
+    const maskPromptEl = byId("tools-mask-prompt");
+    const excludePromptEl = byId("tools-exclude-prompt");
+    const loadCustom = () => { try { return readMaskPresetStore(localStorage.getItem(MASK_PRESET_KEY)); } catch { return []; } };
+    const makeOpt = (value, label) => { const o = document.createElement("option"); o.value = value; o.textContent = label; return o; };
+    function renderToolsMaskPresets(preferred) {
+      const custom = loadCustom();
+      builtinGroup.replaceChildren(...BUILTIN_MASK_PRESETS.map((p) => makeOpt("builtin:" + p.id, p.name)));
+      customGroup.replaceChildren(...custom.map((p) => makeOpt("custom:" + p.name, p.name)));
+      customGroup.hidden = custom.length === 0;
+      const wanted = preferred ?? select.value;
+      const fallback = "builtin:" + DEFAULT_MASK_PRESET.id;
+      select.value = [...select.options].some((o) => o.value === wanted) ? wanted : fallback;
+      deleteBtn.disabled = !select.value.startsWith("custom:");
+    }
+    renderToolsMaskPresets("builtin:" + DEFAULT_MASK_PRESET.id);
+    window.addEventListener("costume-mask-presets-changed", () => renderToolsMaskPresets());
+    select.addEventListener("change", () => {
+      const chosen = findMaskPreset(select.value, loadCustom());
+      if (!chosen) return;
+      maskPromptEl.value = chosen.mask_prompt;
+      excludePromptEl.value = chosen.exclude_prompt;
+      nameInput.value = select.value.startsWith("custom:") ? chosen.name : "";
+      deleteBtn.disabled = !select.value.startsWith("custom:");
+      statusEl.textContent = "Applied “" + chosen.name + "”.";
+    });
+    saveBtn.addEventListener("click", () => {
+      try {
+        const custom = loadCustom();
+        const currentName = select.value.startsWith("custom:") ? (findMaskPreset(select.value, custom)?.name ?? "") : "";
+        const name = normalizeMaskPresetName(nameInput.value || currentName);
+        const overwrite = custom.some((p) => p.name === name);
+        const next = upsertMaskPreset(custom, name, maskPromptEl.value, excludePromptEl.value);
+        localStorage.setItem(MASK_PRESET_KEY, serializeMaskPresetStore(next));
+        renderToolsMaskPresets("custom:" + name);
+        nameInput.value = name;
+        statusEl.textContent = "Preset “" + name + "” " + (overwrite ? "overwritten" : "saved") + ".";
+        window.dispatchEvent(new CustomEvent("costume-mask-presets-changed"));
+        notice("");
+      } catch (error) { notice(error); }
+    });
+    deleteBtn.addEventListener("click", () => {
+      try {
+        const custom = loadCustom();
+        const chosen = select.value.startsWith("custom:") ? findMaskPreset(select.value, custom) : null;
+        if (!chosen) return;
+        const next = removeMaskPreset(custom, chosen.name);
+        localStorage.setItem(MASK_PRESET_KEY, serializeMaskPresetStore(next));
+        renderToolsMaskPresets("builtin:" + DEFAULT_MASK_PRESET.id);
+        nameInput.value = "";
+        statusEl.textContent = "Deleted “" + chosen.name + "”.";
+        window.dispatchEvent(new CustomEvent("costume-mask-presets-changed"));
+        notice("");
+      } catch (error) { notice(error); }
+    });
+  }
+
   byId("tools-auto-mask").addEventListener("click", async () => {
     try {
       if (!current() || busy()) return;
+      let hasPaintedArea = false;
+      if (maskCanvas.width > 0 && maskCanvas.height > 0) {
+        const pixels = maskCanvas.getContext("2d").getImageData(0, 0, maskCanvas.width, maskCanvas.height).data;
+        for (let i = 0; i < pixels.length; i += 4) {
+          if (pixels[i] >= 128) { hasPaintedArea = true; break; }
+        }
+      }
       pending = { kind: "mask_image" };
       await run("mask_image", {
         input_dir: loadedRoot, image_path: current().image,
         output_dir: required(getProject().mask_dir, "Mask output"),
         mask_prompt: required(byId("tools-mask-prompt").value, "What to train on"),
-        exclude_prompt: required(byId("tools-exclude-prompt").value, "What to exclude"),
-        points: guidance, device: byId("mask-device").value
+        exclude_prompt: byId("tools-exclude-prompt").value.trim(),
+        points: guidance,
+        ...(hasPaintedArea ? { guide_mask: maskCanvas.toDataURL("image/png") } : {}),
+        device: byId("mask-device").value
       });
     } catch (error) { pending = null; notice(error); }
   });

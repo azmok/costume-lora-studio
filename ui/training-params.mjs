@@ -38,6 +38,7 @@ export const PARAM_SCHEMA = [
   number("repeats", "repeats", 1, 1, 200, true),
   number("epochs", "epochs", 10, 1, 1000, true),
   number("steps", "steps", 1000, 0, 1000000, true), // 0 = derive from epochs
+  number("save_every_n_epochs", "save-every-n-epochs", 1, 0, 1000, true), // 0 = save every 250 steps
   choice("optimizer", "optimizer", "AdamW", OPTIMIZERS.map((item) => item.value)),
   { key: "optimizer_args", id: "optimizer-args", kind: "text", default: "", max: 300 },
   number("learning_rate", "learning-rate", 0.0001, 0.0000001, 10),
@@ -99,7 +100,6 @@ export function validateParams(values, { required = CORE_KEYS } = {}) {
       result[item.key] = text;
     }
   }
-  if (result.alpha !== undefined && result.rank !== undefined && result.alpha > result.rank) throw new Error("Alpha must be no greater than Rank");
   if (result.optimizer_args) {
     for (const token of result.optimizer_args.split(/\s+/)) {
       if (!/^[A-Za-z_][A-Za-z0-9_]*=\S+$/.test(token)) throw new Error("Optimizer arguments must look like key=value key2=value2");
@@ -116,9 +116,14 @@ const preset = (id, group, name, description, overrides) => ({ id, group, name, 
 export const BUILTIN_PRESETS = [
   preset("clothing-masked", "Recommended — SD1.5 clothing LoRA", "Clothing — with masks (recommended)",
     "Masked loss learns only the clothing. Rank 32 / alpha 16 keeps fabric detail, AdamW8bit + cosine at 1e-4 (text encoder 5e-5), min-SNR 5, noise offset 0.05, shuffled tags with the trigger word kept first. About 1,800 steps for 45 images. Use clip skip 2 for anime checkpoints.",
-    { resolution: 512, batch_size: 2, repeats: 8, epochs: 10, steps: 0, optimizer: "AdamW8bit", learning_rate: 0.0001, text_encoder_lr: 0.00005,
+    { resolution: 512, batch_size: 2, repeats: 8, epochs: 10, steps: 0, save_every_n_epochs: 1, optimizer: "AdamW8bit", learning_rate: 0.0001, text_encoder_lr: 0.00005,
       lr_scheduler: "cosine", lr_warmup_percent: 5, rank: 32, alpha: 16, mixed_precision: "fp16", min_snr_gamma: 5, noise_offset: 0.05,
       clip_skip: 1, shuffle_caption: true, keep_tokens: 1, use_masks: true, gradient_checkpointing: true }),
+  preset("oje-masked-clip2", "Recommended — SD1.5 clothing LoRA", "Oje recommended — Masked clothing (Clip skip 2)",
+    "Tuned for masked clothing LoRAs used on merged/anime checkpoints (Clip skip 2): slightly stronger UNet LR (1.5e-4) to compensate for masked-loss gradient reduction, rank 32 / alpha 16, 12 epochs, saving every epoch to pick the sweetest epoch.",
+    { resolution: 512, batch_size: 2, repeats: 8, epochs: 12, steps: 0, save_every_n_epochs: 1, optimizer: "AdamW8bit", learning_rate: 0.00015, text_encoder_lr: 0.00005,
+      lr_scheduler: "cosine", lr_warmup_percent: 5, rank: 32, alpha: 16, mixed_precision: "fp16", min_snr_gamma: 5, noise_offset: 0.05,
+      clip_skip: 2, shuffle_caption: true, keep_tokens: 1, use_masks: true, gradient_checkpointing: true }),
   preset("clothing-nomask", "Recommended — SD1.5 clothing LoRA", "Clothing — without masks",
     "For datasets without masks: the whole image is learned, so a smaller network (rank 16 / alpha 8) and fewer repeats reduce face / body leakage. Same optimizer and schedule as the masked preset. Describe everything that is NOT the clothing in the captions.",
     { resolution: 512, batch_size: 2, repeats: 6, epochs: 8, steps: 0, optimizer: "AdamW8bit", learning_rate: 0.0001, text_encoder_lr: 0.00005,

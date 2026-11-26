@@ -96,7 +96,10 @@ def generate_masks(payload: dict, segmenter_factory=None) -> Path:
 
     args = options(payload)
     args.mask_prompt = text(payload, "mask_prompt")
-    args.exclude_prompt = text(payload, "exclude_prompt")
+    raw_exclude = payload.get("exclude_prompt", "")
+    if not isinstance(raw_exclude, str) or "\x00" in raw_exclude:
+        raise ValueError("exclude_prompt: invalid text")
+    args.exclude_prompt = raw_exclude.strip()
     # An existing mask folder is allowed: masks that already exist are never overwritten, only skipped.
     paths = generator.validate_inputs(args, allow_existing_output=True)
     if segmenter_factory is None:
@@ -225,7 +228,10 @@ def mask_image(payload: dict, segmenter_factory=None) -> None:
         raise ValueError("The selected image is outside the source folder")
     image = generator.load_image(path)
     args.mask_prompt = segmentation_prompt(text(payload, "mask_prompt"))
-    args.exclude_prompt = segmentation_prompt(text(payload, "exclude_prompt"))
+    raw_exclude = payload.get("exclude_prompt", "")
+    if not isinstance(raw_exclude, str) or "\x00" in raw_exclude:
+        raise ValueError("exclude_prompt: invalid text")
+    args.exclude_prompt = segmentation_prompt(raw_exclude) if raw_exclude.strip() else ""
     points = payload.get("points", [])
     if not isinstance(points, list) or len(points) > 64:
         raise ValueError("Use at most 64 mouse points")
@@ -238,6 +244,23 @@ def mask_image(payload: dict, segmenter_factory=None) -> None:
             "y": number(point, "y", -1, 0, image.height - 1),
             "label": point["label"],
         })
+    raw_guide = payload.get("guide_mask")
+    args.guide_mask = None
+    if raw_guide is not None and raw_guide != "":
+        if not isinstance(raw_guide, str) or not raw_guide.startswith("data:image/png;base64,"):
+            raise ValueError("guide_mask: invalid PNG data URL")
+        from PIL import Image
+
+        encoded = raw_guide.split(",", 1)[1]
+        try:
+            decoded = base64.b64decode(encoded, validate=True)
+            with Image.open(BytesIO(decoded)) as loaded_guide:
+                guide_img = loaded_guide.convert("L")
+                if guide_img.size != image.size:
+                    guide_img = guide_img.resize(image.size, Image.Resampling.NEAREST)
+                args.guide_mask = guide_img
+        except Exception as error:
+            raise ValueError(f"guide_mask: could not decode PNG ({error})") from error
     if segmenter_factory is None:
         emit("Checking model files…", phase="check")
         generator.require_snapshot(args.dino_model_dir, download=True)
@@ -379,14 +402,14 @@ def excluded_sources(payload: dict) -> set:
 
 
 def materialize_selection(selection: dict) -> None:
-    """Build the folder the trainer reads when some images are unchecked: links (or copies) of the chosen
-    images, captions and masks only. The prepared dataset itself is never touched."""
+    """Build the folder the trainer reads when some images are unchecked or captions live in a separate folder:
+    links (or copies) of the chosen images, captions and masks only. The source dataset is never touched."""
     root = selection["root"]
     for image_path, mask_path, caption_path, relative in selection["files"]:
         image_target = root / "images" / relative
         pairs = [(image_path, image_target), (caption_path, image_target.with_suffix(".txt"))]
         if mask_path is not None:
-            pairs.append((mask_path, root / "masks" / relative))
+            pairs.append((mask_path, root / "masks" / relative.with_suffix(mask_path.suffix)))
         for source, target in pairs:
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
@@ -405,6 +428,144 @@ OPTIMIZER_PACKAGES = {
 }
 ADAPTIVE_OPTIMIZERS = ("DAdaptAdam", "DAdaptation", "Prodigy")
 LR_SCHEDULERS = ("constant", "constant_with_warmup", "linear", "cosine", "cosine_with_restarts", "polynomial")
+SAMPLE_SAMPLERS = ("dpmsolver++", "dpmsolver", "euler_a", "euler", "ddim", "dpm_2_a", "dpm_2", "heun", "pndm", "k_euler_a", "k_euler")
+
+
+def build_sample_prompts(prompts: list[str], negative: str, width: int, height: int, steps: int, cfg: float, seed: int) -> str:
+    """Format prompt lines accepted by sd-scripts sample_prompts and gen_img.py --from_file."""
+    neg = " ".join(negative.splitlines()).strip()
+    lines = []
+    for raw in prompts:
+        line = raw.strip()
+        if neg:
+            line += f" --n {neg}"
+        line += f" --w {width} --h {height} --s {steps} --l {cfg:g} --d {seed}"
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def sample_plan(payload: dict, family_id: str, components: dict, clip_skip: int, engine: Path, output: Path, name: str, warnings: list) -> dict | None:
+    every = number(payload, "sample_every_n_epochs", 0, 0, 1000, True)
+    if every == 0:
+        return None
+    raw_prompt = payload.get("sample_prompt", "")
+    if not isinstance(raw_prompt, str) or "\x00" in raw_prompt:
+        raise ValueError("sample_prompt: enter at least one prompt for sample images")
+    prompts = [line.strip() for line in raw_prompt.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not prompts:
+        raise ValueError("sample_prompt: enter at least one prompt for sample images")
+    raw_negative = payload.get("sample_negative", "")
+    if not isinstance(raw_negative, str) or "\x00" in raw_negative:
+        raise ValueError("sample_negative: invalid text")
+    width = number(payload, "sample_width", 512, 256, 2048, True)
+    height = number(payload, "sample_height", 680, 256, 2048, True)
+    if width % 8 or height % 8:
+        raise ValueError("sample_width / sample_height: use multiples of 8")
+    sample_steps = number(payload, "sample_steps", 20, 1, 100, True)
+    cfg = number(payload, "sample_cfg", 7.0, 1.0, 30.0)
+    lora_strength = number(payload, "sample_lora_strength", 0.8, 0.0, 2.0)
+    sampler = choice(payload, "sample_sampler", "dpmsolver++", SAMPLE_SAMPLERS)
+    sample_clip_skip = choice(payload, "sample_clip_skip", 0, (0, 1, 2))
+    sample_seed = number(payload, "sample_seed", 42, 0, 2147483647, True)
+    checkpoint_value = str(payload.get("sample_checkpoint") or "").strip()
+    if checkpoint_value:
+        checkpoint = local_path(payload, "sample_checkpoint", "file")
+        if checkpoint.suffix.lower() != ".safetensors":
+            raise ValueError("sample_checkpoint: choose a .safetensors checkpoint file")
+    else:
+        checkpoint = components["checkpoint"]
+    custom_model = checkpoint.resolve() != components["checkpoint"].resolve()
+    custom_strength = abs(lora_strength - 1.0) > 1e-6
+    effective_clip_skip = clip_skip if sample_clip_skip == 0 else sample_clip_skip
+    custom_clip = effective_clip_skip != clip_skip
+    if (custom_model or custom_strength or custom_clip) and family_id in ("sd15", "sdxl"):
+        if not (engine / "gen_img.py").is_file():
+            raise ValueError("engine_dir: gen_img.py was not found in sd-scripts (required for custom sample model / LoRA strength)")
+        mode = "gen_img"
+    else:
+        if custom_model or custom_strength:
+            warnings.append(f"Custom sample model / LoRA strength is supported for SD1.5 and SDXL; {FAMILIES[family_id]['label']} samples will use the training model at strength 1.0.")
+        mode = "native"
+    prompts_text = build_sample_prompts(prompts, raw_negative, width, height, sample_steps, cfg, sample_seed)
+    return {
+        "mode": mode, "every_n_epochs": every, "checkpoint": checkpoint, "lora_strength": lora_strength,
+        "width": width, "height": height, "steps": sample_steps, "cfg": cfg, "sampler": sampler,
+        "clip_skip": effective_clip_skip, "seed": sample_seed, "prompt_count": len(prompts),
+        "prompts_text": prompts_text, "prompts_file": output / "sample_prompts.txt",
+        "out_dir": output / "sample", "name": name,
+    }
+
+
+def find_sample_checkpoints(output: Path, name: str, every: int) -> list[tuple[str, Path]]:
+    """Epoch checkpoints matching every N epochs plus the final LoRA, in chronological order."""
+    pattern = re.compile(rf"^{re.escape(name)}-(\d+)\.safetensors$", re.IGNORECASE)
+    found = []
+    for path in sorted(output.glob(f"{name}-*.safetensors")):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        epoch_num = int(match.group(1))
+        if epoch_num > 0 and epoch_num % every == 0:
+            found.append((epoch_num, path.stem, path))
+    found.sort(key=lambda item: item[0])
+    targets = [(tag, path) for _, tag, path in found]
+    final = output / f"{name}.safetensors"
+    if final.is_file():
+        targets.append((f"{name}_final", final))
+    return targets
+
+
+def generate_epoch_samples(plan: dict, payload: dict) -> Path:
+    """Run sd-scripts gen_img.py for each saved epoch LoRA using the user's chosen model and LoRA strength."""
+    sample = plan["sample"]
+    targets = find_sample_checkpoints(plan["output"], sample["name"], sample["every_n_epochs"])
+    if not targets:
+        emit("Warning: no saved LoRA files found for sample generation")
+        return sample["out_dir"]
+    sample["prompts_file"].write_text(sample["prompts_text"], encoding="utf-8")
+    out_dir = sample["out_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    precision = payload.get("mixed_precision", "fp16")
+    emit(f"Generating sample images for {len(targets)} checkpoint(s) with {sample['checkpoint'].name} (strength {sample['lora_strength']:g})",
+         phase="run", current=0, total=len(targets))
+    for index, (tag, lora_path) in enumerate(targets, 1):
+        with tempfile.TemporaryDirectory(prefix=".sample-", dir=out_dir) as staging_dir:
+            staging = Path(staging_dir)
+            command = [
+                sys.executable, "-u", str(plan["engine"] / "gen_img.py"),
+                "--sdxl" if plan["family"] == "sdxl" else "--v1",
+                "--ckpt", str(sample["checkpoint"]),
+                "--network_module", "networks.lora",
+                "--network_weights", str(lora_path),
+                "--network_mul", f"{sample['lora_strength']:g}",
+                "--from_file", str(sample["prompts_file"]),
+                "--sampler", sample["sampler"],
+                "--clip_skip", str(sample["clip_skip"]),
+                "--outdir", str(staging),
+                "--sequential_file_name",
+                "--sdpa",
+            ]
+            if precision == "bf16":
+                command.append("--bf16")
+            elif precision == "fp16":
+                command.append("--fp16")
+                if plan["family"] == "sdxl":
+                    command.append("--no_half_vae")
+            if plan["family"] == "sd15" and str(payload.get("tokenizer_dir") or "").strip():
+                command.extend(["--tokenizer_cache_dir", str(Path(payload["tokenizer_dir"]).resolve())])
+            emit(f"Sample image ({tag}): {lora_path.name}", current=index - 1, total=len(targets), phase="run")
+            result = subprocess.run(
+                command, cwd=plan["engine"], stdout=sys.stdout, stderr=sys.stderr,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            if result.returncode:
+                raise RuntimeError(f"Sample generation failed for {lora_path.name} (exit code {result.returncode})")
+            for image_idx, generated in enumerate(sorted(staging.glob("*.png")), 1):
+                target_name = f"{tag}_p{image_idx:02d}.png"
+                shutil.move(str(generated), str(out_dir / target_name))
+        emit(f"Sample saved ({tag})", current=index, total=len(targets), phase="run")
+    emit(f"Sample images saved: {out_dir}")
+    return out_dir
 
 
 def choice(payload: dict, key: str, default, allowed):
@@ -525,13 +686,25 @@ def training_plan(payload: dict) -> dict:
         for name in ("vocab.json", "merges.txt", "tokenizer_config.json"):
             if not (tokenizer / "openai_clip-vit-large-patch14" / name).is_file():
                 raise ValueError(f"Offline CLIP tokenizer is missing: {name}")
-    metadata = json.loads((dataset / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("settings", {}).get("transparent") and not alpha_mask:
-        raise ValueError("This dataset uses transparency. Enable All images use transparency (alpha mask).")
+    metadata_path = dataset / "metadata.json"
+    prepared = metadata_path.is_file()
+    if prepared:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("settings", {}).get("transparent") and not alpha_mask:
+            raise ValueError("This dataset uses transparency. Enable All images use transparency (alpha mask).")
+        records = metadata.get("images", [])
+        if not isinstance(records, list) or not records:
+            raise ValueError("The dataset is empty")
+        source_images_root = dataset / "images"
+        caption_root = None
+    else:
+        raw_images = sorted(path for path in dataset.rglob("*") if path.is_file() and path.suffix.lower() in generator.EXTENSIONS)
+        if not raw_images:
+            raise ValueError(f"No images found in {dataset} (choose a folder of images or a prepared dataset with metadata.json)")
+        records = [{"source": path.relative_to(dataset).as_posix(), "image": path.relative_to(dataset).as_posix()} for path in raw_images]
+        source_images_root = dataset
+        caption_root = local_path(payload, "caption_dir") if str(payload.get("caption_dir") or "").strip() else None
     masks = local_path(payload, "mask_dir") if use_masks else None
-    records = metadata.get("images", [])
-    if not isinstance(records, list) or not records:
-        raise ValueError("The dataset is empty")
     unchecked = excluded_sources(payload)
     left_out = 0
     if unchecked:
@@ -540,17 +713,22 @@ def training_plan(payload: dict) -> dict:
         if not kept:
             raise ValueError("No images are selected for training. Check at least one image in Tools, or turn off “Use only the images selected in Tools”.")
         records = kept
+    if not prepared:
+        stems = [Path(record["image"]).with_suffix("").as_posix().casefold() for record in records]
+        if len(stems) != len(set(stems)):
+            raise ValueError("Selected images with the same filename stem would conflict with captions or masks; rename or uncheck duplicates")
     groups = set()
     chosen = []
     for record in records:
         image_path = contained(dataset, record["image"])
-        image_relative = image_path.relative_to(dataset / "images")
+        image_relative = image_path.relative_to(source_images_root)
         mask_path = None
         if use_masks:
-            mask_path = contained(masks, image_relative.as_posix())
+            mask_relative = image_relative if prepared else image_relative.with_suffix(".png")
+            mask_path = contained(masks, mask_relative.as_posix())
             if not mask_path.is_file():
                 raise ValueError(f"No mask for {record.get('source', image_relative.as_posix())}: {mask_path} (create the mask, uncheck this image in Tools, or turn off “Use masks”)")
-        caption = image_path.with_suffix(".txt")
+        caption = contained(caption_root, image_relative.with_suffix(".txt").as_posix()) if caption_root is not None else image_path.with_suffix(".txt")
         if not caption.is_file() or not caption.read_text(encoding="utf-8").strip():
             raise ValueError(f"Caption is empty or missing: {caption}")
         with Image.open(image_path) as image:
@@ -567,10 +745,16 @@ def training_plan(payload: dict) -> dict:
         groups.add(image_relative.parent.as_posix())
         chosen.append((image_path, mask_path, caption, image_relative))
     output = Path(text(payload, "output_dir")).resolve()
+    overwrite_output = flag(payload, "overwrite_output", False)
     if output == dataset or output.is_relative_to(dataset) or dataset.is_relative_to(output):
         raise ValueError("Keep the training output and the dataset in separate folders")
-    if output.exists() and (not output.is_dir() or any(output.iterdir())):
-        raise ValueError("The training output folder must be new or empty")
+    if masks is not None and (output == masks or output.is_relative_to(masks) or masks.is_relative_to(output)):
+        raise ValueError("Keep the training output and the masks in separate folders")
+    if output.exists():
+        if not output.is_dir():
+            raise ValueError("The training output path is a file, not a folder")
+        if any(output.iterdir()) and not overwrite_output:
+            raise ValueError("The training output folder must be new or empty")
     name = text(payload, "output_name")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}", name):
         raise ValueError("LoRA name must start with a letter or digit and use up to 80 letters, digits, _ or -")
@@ -578,11 +762,12 @@ def training_plan(payload: dict) -> dict:
     if resolution % 64:
         raise ValueError("resolution: use a multiple of 64")
     rank = number(payload, "rank", 16, 1, 512, True)
-    alpha = number(payload, "alpha", 16, 0.1, rank)
+    alpha = number(payload, "alpha", 16, 0.1, 512)
     batch = number(payload, "batch_size", 1, 1, 16, True)
     repeats = number(payload, "repeats", 1, 1, 200, True)
     epochs = number(payload, "epochs", 10, 1, 1000, True)
     steps = number(payload, "steps", 1000, 0 if "epochs" in payload else 1, 1000000, True)
+    save_every_n_epochs = number(payload, "save_every_n_epochs", 1, 0, 1000, True)
     learning_rate = number(payload, "learning_rate", 0.0001, 0.0000001, 10)
     text_encoder_lr = number(payload, "text_encoder_lr", 0, 0, 10)
     warmup_percent = number(payload, "lr_warmup_percent", 0, 0, 50)
@@ -628,8 +813,9 @@ def training_plan(payload: dict) -> dict:
         'bucket_no_upscale = true\nbucket_reso_steps = 64\nmin_bucket_reso = 64\n'
         f'max_bucket_reso = {resolution * 2}\n\n'
     )
-    selection = {"root": output / "selected_dataset", "files": chosen} if left_out else None
-    image_base = selection["root"] / "images" if selection else dataset / "images"
+    separate_captions = caption_root is not None and caption_root != dataset
+    selection = {"root": output / "selected_dataset", "files": chosen} if (left_out or separate_captions) else None
+    image_base = selection["root"] / "images" if selection else source_images_root
     mask_base = (selection["root"] / "masks" if selection else masks) if use_masks else None
     for group in sorted(groups):
         dataset_toml += f'[[datasets.subsets]]\nimage_dir = {quote((image_base / group).as_posix())}\n'
@@ -657,8 +843,25 @@ def training_plan(payload: dict) -> dict:
         "lr_scheduler": scheduler, "seed": seed,
         "masked_loss": use_masks, "gradient_checkpointing": checkpointing,
         "max_data_loader_n_workers": 0,
-        "save_every_n_steps": max(1, min(250, total_steps)),
     })
+    sample = sample_plan(payload, family_id, components, clip_skip, engine, output, name, warnings)
+    if sample and sample["mode"] == "gen_img":
+        every = sample["every_n_epochs"]
+        if save_every_n_epochs == 0:
+            save_every_n_epochs = every
+            warnings.append(f"Enabled Save every {every} epoch(s) so sample images can be generated with {sample['checkpoint'].name}.")
+        elif every % save_every_n_epochs != 0:
+            adjusted = math.gcd(save_every_n_epochs, every)
+            warnings.append(f"Adjusted Save every N epochs from {save_every_n_epochs} to {adjusted} to match sample generation every {every} epoch(s).")
+            save_every_n_epochs = adjusted
+    if save_every_n_epochs > 0:
+        config["save_every_n_epochs"] = save_every_n_epochs
+    else:
+        config["save_every_n_steps"] = max(1, min(250, total_steps))
+    if sample and sample["mode"] == "native":
+        config["sample_every_n_epochs"] = sample["every_n_epochs"]
+        config["sample_prompts"] = sample["prompts_file"].as_posix()
+        config["sample_sampler"] = sample["sampler"]
     known = engine_args(engine)
     if flow or text_encoder_lr <= 0:
         config["network_train_unet_only"] = True
@@ -706,7 +909,8 @@ def training_plan(payload: dict) -> dict:
     tomllib.loads(training_toml)
     tomllib.loads(dataset_toml)
     return {"output": output, "engine": engine, "dataset_toml": dataset_toml, "training_toml": training_toml,
-            "samples": len(records), "left_out": left_out, "selection": selection,
+            "samples": len(records), "left_out": left_out, "selection": selection, "sample": sample,
+            "overwrite_output": overwrite_output, "output_name": name,
             "total_steps": total_steps, "steps_per_epoch": steps_per_epoch, "optimizer": optimizer, "warnings": warnings,
             "family": family_id, "label": family["label"], "script": family["script"]}
 
@@ -740,23 +944,41 @@ def train(payload: dict, check_only=False) -> None:
         return
     output = plan["output"]
     output.mkdir(parents=True, exist_ok=True)
+    if plan["overwrite_output"]:
+        # Remove only previous training artifacts for this LoRA name and stale selection links; never rmtree the whole folder.
+        stale_selection = output / "selected_dataset"
+        if stale_selection.is_dir():
+            shutil.rmtree(stale_selection)
+        lora_name = plan["output_name"]
+        for existing in list(output.glob(f"{lora_name}.safetensors")) + list(output.glob(f"{lora_name}-*.safetensors")):
+            existing.unlink(missing_ok=True)
+        for sample_dir_name in ("sample", "samples"):
+            samples_dir = output / sample_dir_name
+            if samples_dir.is_dir():
+                for existing in list(samples_dir.glob(f"{lora_name}_*.png")) + list(samples_dir.glob(f"{lora_name}-*.png")):
+                    existing.unlink(missing_ok=True)
     if plan["selection"]:
         materialize_selection(plan["selection"])
     (output / "dataset.toml").write_text(plan["dataset_toml"], encoding="utf-8")
     config_path = output / "training.toml"
     config_path.write_text(plan["training_toml"], encoding="utf-8")
+    if plan["sample"] and plan["sample"]["mode"] == "native":
+        plan["sample"]["prompts_file"].write_text(plan["sample"]["prompts_text"], encoding="utf-8")
     command = [sys.executable, "-u", str(plan["engine"] / plan["script"]), "--config_file", str(config_path)]
     emit(f"Starting {plan['label']} LoRA training", command=command, phase="run")
-    result = subprocess.run(command, cwd=plan["engine"], creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    # Explicit stdout/stderr is required on Windows with CREATE_NO_WINDOW, otherwise inherited pipes are detached and all logs/tqdm output disappear.
+    result = subprocess.run(command, cwd=plan["engine"], stdout=sys.stdout, stderr=sys.stderr, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     if result.returncode:
         raise RuntimeError(f"Training process stopped with exit code {result.returncode}")
     if not (output / (payload["output_name"].strip() + ".safetensors")).is_file():
         raise RuntimeError("The training process ended but the final LoRA file was not found")
     emit(f"LoRA saved: {output}")
+    if plan["sample"] and plan["sample"]["mode"] == "gen_img":
+        generate_epoch_samples(plan, payload)
     lora_root = str(payload.get("lora_output_dir") or "").strip()
     if lora_root:
         try:
-            published = comfy_setup.publish_lora(output, payload["output_name"].strip(), lora_root)
+            published = comfy_setup.publish_lora(output, payload["output_name"].strip(), lora_root, overwrite=plan["overwrite_output"])
         except (OSError, ValueError) as error:
             emit(f"Warning: could not copy the LoRA to {lora_root}: {error}")
         else:

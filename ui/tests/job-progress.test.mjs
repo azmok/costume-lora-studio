@@ -13,6 +13,8 @@ test("tqdm lines from downloads and training are parsed", () => {
   assert.equal(steps.label, "steps");
   assert.equal(steps.rate, "1.66it/s");
   assert.equal(steps.eta, "08:48");
+  const initial = parseTqdm("steps:   0%|          | 0/1160 [00:00<?, ?it/s]");
+  assert.deepEqual(initial, { label: "steps", percent: 0, doneText: "0", totalText: "1160", rate: "", eta: "" });
 });
 
 test("ordinary log lines are not mistaken for progress bars", () => {

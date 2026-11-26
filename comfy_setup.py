@@ -19,15 +19,19 @@ DEFAULT_TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
 USER_AGENT = "costume-lora-studio/1.0"
 
 
-def publish_lora(output: Path, name: str, lora_root: str) -> dict:
-    """Copies <name>.safetensors and its step versions to <lora_root>/<name>/ (a new folder if that one is in use)."""
+def publish_lora(output: Path, name: str, lora_root: str, overwrite: bool = False) -> dict:
+    """Copies <name>.safetensors and its step/epoch versions to <lora_root>/<name>/ (overwrites if requested, else uses a timestamped folder)."""
     files = sorted(output.glob(f"{name}*.safetensors"))
     if not files:
         raise ValueError(f"No LoRA files named {name}*.safetensors in {output}")
     root = Path(lora_root)
     target = root / name
     if target.exists() and any(target.iterdir()):
-        target = root / f"{name}_{time.strftime('%Y%m%d-%H%M%S')}"
+        if overwrite:
+            for existing in target.glob(f"{name}*.safetensors"):
+                existing.unlink(missing_ok=True)
+        else:
+            target = root / f"{name}_{time.strftime('%Y%m%d-%H%M%S')}"
     target.mkdir(parents=True, exist_ok=True)
     for path in files:
         shutil.copy2(path, target / path.name)

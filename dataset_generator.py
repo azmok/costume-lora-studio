@@ -48,8 +48,8 @@ VLM_PROMPT = (
     "Do not describe or mention clothing, outfits, accessories, garment design, "
     "garment colors, fabrics, or patterns. Do not include introductions or lists."
 )
-CLOTHES_PROMPT = "clothes, clothing, dress, jacket, pants, skirt, outfit"
-EXCLUDE_PROMPT = "face, hair, hands, bare arms, bare legs, bare feet, exposed skin"
+CLOTHES_PROMPT = "white shirt, t-shirt, shorts, underwear, swimsuit"
+EXCLUDE_PROMPT = "face, hair"
 
 
 def nonempty(value: str) -> str:
@@ -330,7 +330,10 @@ class GroundedSAM:
     def detect(self, image: Image.Image, prompt: str):
         import torch
 
-        prompt = ". ".join(term.strip().lower().rstrip(".") for term in prompt.split(",")) + "."
+        terms = [term.strip().lower().rstrip(".") for term in prompt.split(",") if term.strip().rstrip(".")]
+        if not terms:
+            return torch.empty((0, 4), dtype=torch.float32)
+        prompt = ". ".join(terms) + "."
         inputs = self.detector_processor(images=image, text=prompt, return_tensors="pt").to(self.device)
         with torch.inference_mode():
             outputs = self.detector(**inputs)
@@ -344,39 +347,176 @@ class GroundedSAM:
         )[0]
         return result["boxes"].detach().cpu()
 
+    @staticmethod
+    def _mask_regions(guide_mask: Image.Image) -> list[tuple[list[float], list[list[float]]]]:
+        """Extract (expanded_box, interior_sample_points) for each painted connected component."""
+        from collections import deque
+        import numpy as np
+        from PIL import Image
+
+        arr = np.asarray(guide_mask.convert("L")) >= 128
+        h, w = arr.shape
+        if not np.any(arr):
+            return []
+        scale = max(1, max(h, w) // 256)
+        sh, sw = max(1, h // scale), max(1, w // scale)
+        small = np.asarray(
+            Image.fromarray(arr.astype(np.uint8) * 255).resize((sw, sh), Image.Resampling.NEAREST)
+        ) >= 128
+        visited = np.zeros((sh, sw), dtype=bool)
+        regions: list[tuple[list[float], list[list[float]]]] = []
+        for y in range(sh):
+            for x in range(sw):
+                if not small[y, x] or visited[y, x]:
+                    continue
+                q = deque([(y, x)])
+                visited[y, x] = True
+                coords = []
+                while q:
+                    cy, cx = q.popleft()
+                    coords.append((cy, cx))
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                        if 0 <= ny < sh and 0 <= nx < sw and small[ny, nx] and not visited[ny, nx]:
+                            visited[ny, nx] = True
+                            q.append((ny, nx))
+                if len(coords) < 4 and len(coords) < max(1, int(small.sum() * 0.05)):
+                    continue
+                ys = [pt[0] for pt in coords]
+                xs = [pt[1] for pt in coords]
+                x0, x1 = min(xs) * scale, min(w - 1, (max(xs) + 1) * scale)
+                y0, y1 = min(ys) * scale, min(h - 1, (max(ys) + 1) * scale)
+                bw, bh = max(1, x1 - x0), max(1, y1 - y0)
+                pad_x = max(8.0, bw * 0.14)
+                pad_y = max(8.0, bh * 0.14)
+                box = [
+                    max(0.0, float(x0) - pad_x),
+                    max(0.0, float(y0) - pad_y),
+                    min(float(w - 1), float(x1) + pad_x),
+                    min(float(h - 1), float(y1) + pad_y),
+                ]
+                # Evenly sample up to 8 interior points across the painted region for SAM guidance.
+                coords.sort()
+                count = min(8, len(coords))
+                step = len(coords) / count
+                pts = []
+                for idx in range(count):
+                    py, px = coords[min(len(coords) - 1, int((idx + 0.5) * step))]
+                    pts.append([
+                        min(float(w - 1), (px + 0.5) * scale),
+                        min(float(h - 1), (py + 0.5) * scale),
+                    ])
+                regions.append((box, pts))
+        return regions
+
     def segment(self, image: Image.Image) -> Image.Image:
         import numpy as np
         import torch
         from PIL import Image
 
+        guide_mask = getattr(self.args, "guide_mask", None)
+        painted_regions = self._mask_regions(guide_mask) if guide_mask is not None else []
+        guide_arr = (
+            (np.asarray(guide_mask.convert("L").resize(image.size, Image.Resampling.NEAREST)) >= 128)
+            if painted_regions else None
+        )
+
         clothes = self.detect(image, self.args.mask_prompt)
-        if not len(clothes):
-            raise ValueError("No clothing detected; adjust prompts or thresholds")
+        if not len(clothes) and not painted_regions:
+            raise ValueError("No clothing detected; adjust prompts or paint a rough guide area")
         excluded = self.detect(image, self.args.exclude_prompt)
-        boxes = torch.cat([clothes, excluded])
+        img_area = max(1, image.width * image.height)
+        # Drop runaway exclude boxes covering >=60% of the image (e.g. "background" / "exposed skin" erasing all clothing).
+        if len(excluded):
+            kept_excl = [
+                box for box in excluded
+                if max(0.0, float((box[2] - box[0]) * (box[3] - box[1]))) < 0.60 * img_area
+            ]
+            excluded = torch.stack(kept_excl) if kept_excl else torch.empty((0, 4), dtype=torch.float32)
+
         union = np.zeros((image.height, image.width), dtype=bool)
         protected = np.zeros_like(union)
         image_inputs = self.sam_processor(images=image, return_tensors="pt").to(self.device)
         with torch.inference_mode():
             embeddings = self.sam.get_image_embeddings(image_inputs.pixel_values)
-            for index, box in enumerate(boxes):
-                prompts = {"images": image, "input_boxes": [[box.tolist()]], "return_tensors": "pt"}
-                points = getattr(self.args, "mask_points", []) if index < len(clothes) else []
-                positive = [point for point in points if point["label"] == 1]
-                if positive and not any(box[0] <= point["x"] <= box[2] and box[1] <= point["y"] <= box[3] for point in positive):
-                    continue
-                if points:
-                    prompts["input_points"] = [[[point["x"], point["y"]] for point in points]]
-                    prompts["input_labels"] = [[point["label"] for point in points]]
+            all_points = getattr(self.args, "mask_points", [])
+            neg_points = [point for point in all_points if point["label"] == 0]
+
+            def run_sam(box_coords: list[float], pos_pts: list[list[float]] | None = None, extra_pts: list[dict] | None = None) -> np.ndarray:
+                prompts = {"images": image, "input_boxes": [[box_coords]], "return_tensors": "pt"}
+                pts_xy = list(pos_pts or [])
+                pts_lbl = [1] * len(pts_xy)
+                for pt in extra_pts or []:
+                    pts_xy.append([pt["x"], pt["y"]])
+                    pts_lbl.append(pt["label"])
+                if pts_xy:
+                    prompts["input_points"] = [pts_xy]
+                    prompts["input_labels"] = [pts_lbl]
                 inputs = self.sam_processor(**prompts).to(self.device)
-                outputs = self.sam(image_embeddings=embeddings, input_boxes=inputs.input_boxes, multimask_output=False)
+                sam_kwargs = {"image_embeddings": embeddings, "input_boxes": inputs.input_boxes, "multimask_output": False}
+                if "input_points" in inputs and "input_labels" in inputs:
+                    sam_kwargs["input_points"] = inputs.input_points
+                    sam_kwargs["input_labels"] = inputs.input_labels
+                outputs = self.sam(**sam_kwargs)
                 masks = self.sam_processor.image_processor.post_process_masks(
                     outputs.pred_masks.cpu(), inputs.original_sizes.cpu(), inputs.reshaped_input_sizes.cpu(),
                 )
-                region = masks[0][0, 0].numpy().astype(bool)
-                if index < len(clothes):
-                    union |= region
-                else:
+                return masks[0][0, 0].numpy().astype(bool)
+
+            if painted_regions:
+                # 1. Refine each manually painted area directly with SAM (box + interior positive points + any erase points).
+                for box_coords, sample_pts in painted_regions:
+                    in_box_neg = [
+                        pt for pt in neg_points
+                        if box_coords[0] <= pt["x"] <= box_coords[2] and box_coords[1] <= pt["y"] <= box_coords[3]
+                    ]
+                    union |= run_sam(box_coords, pos_pts=sample_pts, extra_pts=in_box_neg)
+                # 2. Also include text-detected boxes that overlap the painted area so SAM snaps to full garment edges.
+                for box in clothes:
+                    bx0 = max(0, int(box[0]))
+                    by0 = max(0, int(box[1]))
+                    bx1 = min(image.width, int(box[2]))
+                    by1 = min(image.height, int(box[3]))
+                    if bx1 <= bx0 or by1 <= by0:
+                        continue
+                    box_area = max(1, (bx1 - bx0) * (by1 - by0))
+                    if box_area >= 0.75 * img_area:
+                        continue
+                    if guide_arr is not None and np.any(guide_arr[by0:by1, bx0:bx1]):
+                        in_box_neg = [
+                            pt for pt in neg_points
+                            if box[0] <= pt["x"] <= box[2] and box[1] <= pt["y"] <= box[3]
+                        ]
+                        # Sample interior points of guide_arr inside this text box
+                        gy, gx = np.where(guide_arr[by0:by1, bx0:bx1])
+                        count = min(6, len(gy))
+                        step = len(gy) / count
+                        pts = [
+                            [float(bx0 + gx[min(len(gx) - 1, int((i + 0.5) * step))]),
+                             float(by0 + gy[min(len(gy) - 1, int((i + 0.5) * step))])]
+                            for i in range(count)
+                        ]
+                        union |= run_sam(box.tolist(), pos_pts=pts, extra_pts=in_box_neg)
+            else:
+                all_positive = [point for point in all_points if point["label"] == 1]
+                any_box_has_pos = any(
+                    box[0] <= point["x"] <= box[2] and box[1] <= point["y"] <= box[3]
+                    for box in clothes for point in all_positive
+                )
+                for box in clothes:
+                    extra_pts = []
+                    if all_points:
+                        in_box = [
+                            point for point in all_points
+                            if box[0] <= point["x"] <= box[2] and box[1] <= point["y"] <= box[3]
+                        ]
+                        if any_box_has_pos and not any(point["label"] == 1 for point in in_box):
+                            continue
+                        extra_pts = in_box
+                    union |= run_sam(box.tolist(), extra_pts=extra_pts)
+
+            for box in excluded:
+                region = run_sam(box.tolist())
+                if region.mean() < 0.55:
                     protected |= region
         return Image.fromarray((union & ~protected).astype(np.uint8) * 255)
 

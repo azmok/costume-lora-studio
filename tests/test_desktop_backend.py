@@ -1,3 +1,5 @@
+import base64
+from io import BytesIO
 import json
 from pathlib import Path
 import tempfile
@@ -398,6 +400,7 @@ class WorkflowTests(unittest.TestCase):
         class Segmenter:
             def __init__(self, args):
                 captured["prompt"] = args.mask_prompt
+                captured["exclude"] = args.exclude_prompt
                 captured["points"] = args.mask_points
             def segment(self, image):
                 mask = Image.new("L", image.size)
@@ -412,8 +415,26 @@ class WorkflowTests(unittest.TestCase):
             desktop.mask_image(payload, Segmenter)
         self.assertFalse(output.exists())
         self.assertEqual(captured["prompt"], "red jacket")
+        self.assertEqual(captured["exclude"], "face, hair")
         self.assertEqual(captured["points"][0]["x"], 100)
         self.assertTrue(emitted.call_args.kwargs["preview_mask"].startswith("data:image/png;base64,"))
+        # Empty exclude_prompt is allowed (no exclusion) + painted guide_mask PNG data URL is decoded
+        guide = Image.new("L", (256, 128), 0)
+        guide.paste(255, (80, 40, 160, 100))
+        buf = BytesIO()
+        guide.save(buf, format="PNG")
+        guide_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+        class GuideSegmenter(Segmenter):
+            def __init__(self, args):
+                super().__init__(args)
+                captured["guide_mask"] = args.guide_mask
+        with patch("desktop_backend.emit"):
+            desktop.mask_image({**payload, "exclude_prompt": "   ", "guide_mask": guide_url}, GuideSegmenter)
+        self.assertEqual(captured["exclude"], "")
+        self.assertIsNotNone(captured["guide_mask"])
+        self.assertEqual(captured["guide_mask"].size, (256, 128))
+        with self.assertRaisesRegex(ValueError, "guide_mask"):
+            desktop.mask_image({**payload, "guide_mask": "not-a-data-url"}, GuideSegmenter)
 
     def test_training_plan_masked_loss_and_offline_tokenizer(self):
         payload = self.training_payload()
@@ -435,7 +456,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(tomllib.loads(desktop.training_plan(payload)["dataset_toml"])["datasets"][0]["subsets"][0]["num_repeats"], 1)
         self.add_dataset_image(payload, "second")
         payload.update({
-            "repeats": 8, "epochs": 10, "steps": 0, "batch_size": 2, "optimizer": "AdamW8bit", "optimizer_args": "weight_decay=0.01 betas=(0.9,0.99)",
+            "repeats": 8, "epochs": 10, "steps": 0, "save_every_n_epochs": 2, "batch_size": 2, "optimizer": "AdamW8bit", "optimizer_args": "weight_decay=0.01 betas=(0.9,0.99)",
             "learning_rate": 0.0001, "text_encoder_lr": 0.00005, "lr_scheduler": "cosine_with_restarts", "lr_warmup_percent": 5,
             "lr_scheduler_num_cycles": 3, "rank": 32, "alpha": 16, "min_snr_gamma": 5, "noise_offset": 0.05, "clip_skip": 2,
             "shuffle_caption": True, "keep_tokens": 1, "gradient_checkpointing": False,
@@ -445,6 +466,8 @@ class WorkflowTests(unittest.TestCase):
         dataset = tomllib.loads(plan["dataset_toml"])
         self.assertEqual((plan["steps_per_epoch"], plan["total_steps"]), (8, 80))  # 2 images x 8 repeats / batch 2
         self.assertEqual(config["max_train_epochs"], 10)
+        self.assertEqual(config["save_every_n_epochs"], 2)
+        self.assertNotIn("save_every_n_steps", config)
         self.assertNotIn("max_train_steps", config)
         self.assertEqual((config["optimizer_type"], config["optimizer_args"], config["lr_scheduler"]), ("AdamW8bit", ["weight_decay=0.01", "betas=(0.9,0.99)"], "cosine_with_restarts"))
         self.assertEqual((config["lr_warmup_steps"], config["lr_scheduler_num_cycles"], config["min_snr_gamma"], config["noise_offset"], config["clip_skip"]), (4, 3, 5, 0.05, 2))
@@ -458,6 +481,9 @@ class WorkflowTests(unittest.TestCase):
         limited = desktop.training_plan(payload)
         self.assertEqual(limited["total_steps"], 50)
         self.assertEqual(tomllib.loads(limited["training_toml"])["max_train_steps"], 50)
+        # Alpha greater than Rank is allowed (matches kohya sd-scripts, e.g. dim 8 / alpha 16)
+        boosted = tomllib.loads(desktop.training_plan({**payload, "rank": 8, "alpha": 16})["training_toml"])
+        self.assertEqual((boosted["network_dim"], boosted["network_alpha"]), (8, 16))
 
     def test_training_without_masks_needs_no_mask_files(self):
         payload = self.training_payload()
@@ -480,7 +506,7 @@ class WorkflowTests(unittest.TestCase):
         payload = self.training_payload()
         for patch_values, pattern in (
             ({"optimizer": "SGD"}, "optimizer"), ({"lr_scheduler": "step"}, "lr_scheduler"), ({"repeats": 0}, "repeats"),
-            ({"epochs": 1.5}, "epochs"), ({"clip_skip": 3}, "clip_skip"), ({"use_masks": "no"}, "use_masks"),
+            ({"epochs": 1.5}, "epochs"), ({"save_every_n_epochs": -1}, "save_every_n_epochs"), ({"save_every_n_epochs": 1.5}, "save_every_n_epochs"), ({"clip_skip": 3}, "clip_skip"), ({"use_masks": "no"}, "use_masks"),
             ({"optimizer_args": "oops"}, "optimizer_args"), ({"alpha": 600, "rank": 512}, "alpha"), ({"batch_size": 17}, "batch_size"),
             ({"lr_warmup_percent": 60}, "lr_warmup_percent"), ({"shuffle_caption": 1}, "shuffle_caption"),
         ):
@@ -680,6 +706,8 @@ class WorkflowTests(unittest.TestCase):
             config = tomllib.loads(Path(command[-1]).read_text(encoding="utf-8"))
             self.assertTrue(config["masked_loss"])
             self.assertNotIn("shell", kwargs)
+            self.assertIs(kwargs.get("stdout"), desktop.sys.stdout)
+            self.assertIs(kwargs.get("stderr"), desktop.sys.stderr)
             Path(payload["output_dir"], payload["output_name"] + ".safetensors").touch()
             return SimpleNamespace(returncode=0)
 
@@ -841,3 +869,182 @@ class ExistingMaskTests(unittest.TestCase):
         self.assertEqual(created, [])
         self.assertEqual({path.name: path.read_bytes() for path in self.masks.rglob("*.png")}, snapshot)
         self.assertEqual(len([m for m, _ in events if m.startswith("[SKIP]")]), 3)
+
+
+@unittest.skipUnless(HAS_IMAGES, "Pillow / numpy required")
+class RawFolderTrainingTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.img = self.root / "img"
+        self.mask = self.root / "mask"
+        self.img.mkdir()
+        self.mask.mkdir()
+        Image.new("RGB", (256, 128), "red").save(self.img / "keep_a.jpg")
+        (self.img / "keep_a.txt").write_text("costume, standing", encoding="utf-8")
+        mask_a = Image.new("L", (256, 128), 0)
+        mask_a.paste(255, (64, 32, 192, 96))
+        mask_a.save(self.mask / "keep_a.png")
+        Image.new("RGB", (256, 128), "blue").save(self.img / "keep_b.png")
+        (self.img / "keep_b.txt").write_text("costume, sitting", encoding="utf-8")
+        mask_b = Image.new("L", (256, 128), 0)
+        mask_b.paste(255, (32, 16, 128, 96))
+        mask_b.save(self.mask / "keep_b.png")
+        # Excluded image intentionally has no mask
+        Image.new("RGB", (256, 128), "green").save(self.img / "skip_nomask.png")
+        (self.img / "skip_nomask.txt").write_text("costume, excluded", encoding="utf-8")
+        engine = self.root / "engine"
+        (engine / "networks").mkdir(parents=True)
+        (engine / "train_network.py").touch()
+        (engine / "networks" / "lora.py").touch()
+        checkpoint = self.root / "sd15.safetensors"
+        checkpoint.touch()
+        tokenizer = self.root / "tokenizers" / "openai_clip-vit-large-patch14"
+        tokenizer.mkdir(parents=True)
+        for name in ("vocab.json", "merges.txt", "tokenizer_config.json"):
+            (tokenizer / name).touch()
+        self.base_payload = {
+            "dataset_dir": str(self.img),
+            "mask_dir": str(self.mask),
+            "engine_dir": str(engine),
+            "checkpoint": str(checkpoint),
+            "tokenizer_dir": str(tokenizer.parent),
+            "output_dir": str(self.root / "lora"),
+            "output_name": "costume_raw",
+        }
+
+    def test_raw_folder_trains_with_jpg_images_png_masks_and_excluded_sources(self):
+        payload = {**self.base_payload, "excluded_sources": ["skip_nomask.png"]}
+        plan = desktop.training_plan(payload)
+        self.assertEqual((plan["samples"], plan["left_out"]), (2, 1))
+        self.assertIsNotNone(plan["selection"])
+        desktop.materialize_selection(plan["selection"])
+        root = plan["selection"]["root"]
+        self.assertEqual(sorted(p.name for p in (root / "images").iterdir()), ["keep_a.jpg", "keep_a.txt", "keep_b.png", "keep_b.txt"])
+        self.assertEqual(sorted(p.name for p in (root / "masks").iterdir()), ["keep_a.png", "keep_b.png"])
+        subsets = tomllib.loads(plan["dataset_toml"])["datasets"][0]["subsets"]
+        self.assertEqual(len(subsets), 1)
+        self.assertEqual(Path(subsets[0]["image_dir"]), root / "images")
+        self.assertEqual(Path(subsets[0]["conditioning_data_dir"]), root / "masks")
+
+    def test_raw_folder_without_exclusions_points_directly_and_supports_separate_captions(self):
+        (self.img / "skip_nomask.png").unlink()
+        (self.img / "skip_nomask.txt").unlink()
+        plan = desktop.training_plan(self.base_payload)
+        self.assertEqual((plan["samples"], plan["left_out"], plan["selection"]), (2, 0, None))
+        subsets = tomllib.loads(plan["dataset_toml"])["datasets"][0]["subsets"]
+        self.assertEqual(Path(subsets[0]["image_dir"]), self.img.resolve())
+        self.assertEqual(Path(subsets[0]["conditioning_data_dir"]), self.mask.resolve())
+        captions = self.root / "captions"
+        captions.mkdir()
+        for stem in ("keep_a", "keep_b"):
+            (self.img / f"{stem}.txt").replace(captions / f"{stem}.txt")
+        separate = desktop.training_plan({**self.base_payload, "caption_dir": str(captions)})
+        self.assertIsNotNone(separate["selection"])
+        desktop.materialize_selection(separate["selection"])
+        self.assertEqual(sorted(p.name for p in (separate["selection"]["root"] / "images").iterdir()), ["keep_a.jpg", "keep_a.txt", "keep_b.png", "keep_b.txt"])
+
+    def test_raw_folder_rejects_empty_dir_empty_enter_and_stem_collisions(self):
+        empty = self.root / "empty"
+        empty.mkdir()
+        with self.assertRaisesRegex(ValueError, "No images found"):
+            desktop.training_plan({**self.base_payload, "dataset_dir": str(empty)})
+        with self.assertRaisesRegex(ValueError, "dataset_dir"):
+            desktop.training_plan({**self.base_payload, "dataset_dir": "\n"})
+        Image.new("RGB", (256, 128), "red").save(self.img / "keep_a.png")
+        with self.assertRaisesRegex(ValueError, "same filename stem"):
+            desktop.training_plan({**self.base_payload, "excluded_sources": ["skip_nomask.png"]})
+
+    def test_sample_images_support_native_and_custom_model_strength_modes(self):
+        payload = {**self.base_payload, "excluded_sources": ["skip_nomask.png"], "epochs": 6, "steps": 0}
+        # Native mode: training checkpoint at strength 1.0, same clip skip
+        native = desktop.training_plan({
+            **payload, "sample_every_n_epochs": 2, "sample_prompt": "costume, 1girl\ncostume, from behind",
+            "sample_negative": "worst quality", "sample_lora_strength": 1.0, "sample_width": 512, "sample_height": 680,
+            "sample_steps": 20, "sample_cfg": 7.0, "sample_sampler": "dpmsolver++", "sample_clip_skip": 0, "sample_seed": 42,
+        })
+        self.assertEqual(native["sample"]["mode"], "native")
+        self.assertEqual(native["sample"]["out_dir"], Path(payload["output_dir"]).resolve() / "sample")
+        cfg = tomllib.loads(native["training_toml"])
+        self.assertEqual((cfg["sample_every_n_epochs"], cfg["sample_sampler"]), (2, "dpmsolver++"))
+        self.assertIn("--n worst quality --w 512 --h 680 --s 20 --l 7 --d 42", native["sample"]["prompts_text"])
+        # Default save_every_n_epochs is 1 (save every epoch)
+        default_cfg = tomllib.loads(desktop.training_plan(payload)["training_toml"])
+        self.assertEqual(default_cfg["save_every_n_epochs"], 1)
+        # Custom mode: separate sample checkpoint + LoRA strength 0.8 + Clip skip 2 (with save_every_n_epochs=0 auto-enabled)
+        (Path(payload["engine_dir"]) / "gen_img.py").touch()
+        other_ckpt = self.root / "kimchimix.safetensors"
+        other_ckpt.touch()
+        custom_payload = {
+            **payload, "save_every_n_epochs": 0, "sample_every_n_epochs": 2, "sample_checkpoint": str(other_ckpt),
+            "sample_prompt": "costume, standing", "sample_negative": "low quality",
+            "sample_lora_strength": 0.8, "sample_width": 512, "sample_height": 680,
+            "sample_steps": 18, "sample_cfg": 6.5, "sample_sampler": "euler_a", "sample_clip_skip": 2, "sample_seed": 99,
+        }
+        custom = desktop.training_plan(custom_payload)
+        self.assertEqual(custom["sample"]["mode"], "gen_img")
+        self.assertEqual(custom["sample"]["out_dir"], Path(payload["output_dir"]).resolve() / "sample")
+        custom_cfg = tomllib.loads(custom["training_toml"])
+        self.assertEqual(custom_cfg["save_every_n_epochs"], 2)  # auto-enabled for epoch sampling
+        self.assertNotIn("sample_every_n_epochs", custom_cfg)
+        # End-to-end mocked train() invokes gen_img.py for each matching epoch checkpoint + final
+        torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+        seen_cmds = []
+
+        def run_stub(command, **kwargs):
+            seen_cmds.append(command)
+            if command[2].endswith("train_network.py"):
+                for name in ("costume_raw-000002.safetensors", "costume_raw-000003.safetensors", "costume_raw-000004.safetensors", "costume_raw.safetensors"):
+                    (Path(payload["output_dir"]) / name).touch()
+            else:
+                outdir = Path(command[command.index("--outdir") + 1])
+                Image.new("RGB", (64, 64), "white").save(outdir / "im_000001.png")
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict("sys.modules", {"torch": torch_stub, "transformers": SimpleNamespace(CLIPTokenizer=Mock())}):
+            with patch("desktop_backend.subprocess.run", side_effect=run_stub), patch("desktop_backend.emit"):
+                desktop.train(custom_payload)
+        gen_cmds = [cmd for cmd in seen_cmds if cmd[2].endswith("gen_img.py")]
+        self.assertEqual(len(gen_cmds), 3)  # epoch 2, epoch 4, final (epoch 3 skipped)
+        self.assertIn("--v1", gen_cmds[0])
+        self.assertEqual(gen_cmds[0][gen_cmds[0].index("--network_mul") + 1], "0.8")
+        self.assertEqual(gen_cmds[0][gen_cmds[0].index("--ckpt") + 1], str(other_ckpt.resolve()))
+        saved_samples = sorted(p.name for p in (Path(payload["output_dir"]) / "sample").glob("*.png"))
+        self.assertEqual(saved_samples, ["costume_raw-000002_p01.png", "costume_raw-000004_p01.png", "costume_raw_final_p01.png"])
+        # Empty / Enter-only prompt and non-multiple-of-8 size are rejected
+        fresh_out = {**custom_payload, "output_dir": str(self.root / "lora2")}
+        with self.assertRaisesRegex(ValueError, "sample_prompt"):
+            desktop.training_plan({**fresh_out, "sample_prompt": "\n  "})
+        with self.assertRaisesRegex(ValueError, "multiples of 8"):
+            desktop.training_plan({**fresh_out, "sample_width": 515})
+
+    def test_overwrite_output_allows_reusing_folder_and_cleans_only_matching_lora_artifacts(self):
+        payload = {**self.base_payload, "excluded_sources": ["skip_nomask.png"]}
+        out = Path(payload["output_dir"])
+        out.mkdir()
+        (out / "costume_raw.safetensors").write_bytes(b"old-final")
+        (out / "costume_raw-000002.safetensors").write_bytes(b"old-e2")
+        (out / "keep_unrelated.txt").write_text("keep", encoding="utf-8")
+        sample_dir = out / "sample"
+        sample_dir.mkdir()
+        (sample_dir / "costume_raw-000002_p01.png").write_bytes(b"old-sample-e2")
+        (sample_dir / "costume_raw_final_p01.png").write_bytes(b"old-sample-final")
+        (sample_dir / "other_lora-000001_p01.png").write_bytes(b"keep-other-sample")
+        with self.assertRaisesRegex(ValueError, "must be new or empty"):
+            desktop.training_plan(payload)
+        torch_stub = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
+
+        def run_stub(command, **kwargs):
+            self.assertFalse((out / "costume_raw-000002.safetensors").exists())
+            self.assertFalse((sample_dir / "costume_raw-000002_p01.png").exists())
+            self.assertFalse((sample_dir / "costume_raw_final_p01.png").exists())
+            (out / "costume_raw.safetensors").write_bytes(b"new-final")
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict("sys.modules", {"torch": torch_stub, "transformers": SimpleNamespace(CLIPTokenizer=Mock())}):
+            with patch("desktop_backend.subprocess.run", side_effect=run_stub), patch("desktop_backend.emit"):
+                desktop.train({**payload, "overwrite_output": True})
+        self.assertEqual((out / "costume_raw.safetensors").read_bytes(), b"new-final")
+        self.assertEqual((out / "keep_unrelated.txt").read_text(encoding="utf-8"), "keep")
+        self.assertEqual((sample_dir / "other_lora-000001_p01.png").read_bytes(), b"keep-other-sample")

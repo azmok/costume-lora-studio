@@ -23,6 +23,10 @@ test("every built-in preset is valid, complete and uses a known optimizer and sc
 test("the two clothing presets differ in masks, as asked, and are the recommended ones", () => {
   const masked = builtinPreset("clothing-masked").parameters;
   const plain = builtinPreset("clothing-nomask").parameters;
+  const oje = builtinPreset("oje-masked-clip2").parameters;
+  assert.equal(DEFAULT_PARAMS.save_every_n_epochs, 1);
+  assert.equal(masked.save_every_n_epochs, 1);
+  assert.equal(oje.save_every_n_epochs, 1);
   assert.equal(masked.use_masks, true);
   assert.equal(plain.use_masks, false);
   assert.ok(plain.rank < masked.rank);
@@ -48,11 +52,12 @@ test("form ids are unique and every control maps to one parameter", () => {
 
 test("validation: ranges, choices, flags and optimizer arguments", () => {
   assert.equal(validateParams({ steps: 0, batch_size: 1, rank: 8, alpha: 4, learning_rate: 1, seed: 1 }).steps, 0);
-  for (const patch of [{ repeats: 0 }, { epochs: 1.5 }, { batch_size: 17 }, { lr_warmup_percent: 51 }, { resolution: 513 }, { optimizer: "SGD" },
+  for (const patch of [{ repeats: 0 }, { epochs: 1.5 }, { save_every_n_epochs: -1 }, { save_every_n_epochs: 1.5 }, { batch_size: 17 }, { lr_warmup_percent: 51 }, { resolution: 513 }, { optimizer: "SGD" },
     { lr_scheduler: "step" }, { clip_skip: 3 }, { use_masks: "maybe" }, { optimizer_args: "decouple" }, { optimizer_args: "a=1 b" }, { alpha: 600 }, { noise_offset: 2 }]) {
     assert.throws(() => validateParams({ ...DEFAULT_PARAMS, ...patch }), undefined, JSON.stringify(patch));
   }
-  assert.throws(() => validateParams({ ...DEFAULT_PARAMS, rank: 8, alpha: 16 }), /Alpha must be no greater/);
+  const alphaAboveRank = validateParams({ ...DEFAULT_PARAMS, rank: 8, alpha: 16 });
+  assert.deepEqual([alphaAboveRank.rank, alphaAboveRank.alpha], [8, 16]);
   const parsed = validateParams({ ...DEFAULT_PARAMS, resolution: "640", use_masks: "false", optimizer_args: " a=1   b=(0.9,0.99) " });
   assert.equal(parsed.resolution, 640);
   assert.equal(parsed.use_masks, false);

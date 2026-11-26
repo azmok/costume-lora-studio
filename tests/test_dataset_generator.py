@@ -342,3 +342,120 @@ class ModelDownloadTest(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     generator.require_snapshot(Path(root) / "grounding-dino", download=True)
             self.assertIn("download failed", str(caught.exception))
+
+
+class GroundedSAMFixTest(unittest.TestCase):
+    def test_defaults_use_buruma_safe_prompts(self):
+        self.assertEqual(generator.CLOTHES_PROMPT, "white shirt, t-shirt, shorts, underwear, swimsuit")
+        self.assertEqual(generator.EXCLUDE_PROMPT, "face, hair")
+
+    def test_sam_receives_guide_points_and_ignores_giant_exclude_box(self):
+        if not HAS_IMAGES or importlib.util.find_spec("torch") is None:
+            self.skipTest("torch/PIL/numpy required")
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        seg = object.__new__(generator.GroundedSAM)
+        seg.device = "cpu"
+        seg.args = SimpleNamespace(
+            mask_prompt="white shirt, shorts, ",
+            exclude_prompt="face, hair, background",
+            mask_points=[{"x": 50, "y": 50, "label": 1}],
+        )
+        # Clothing box is 20..80 (36% area); giant exclude box is 0..100 (100% area -> must be ignored!)
+        seg.detect = lambda image, prompt: (
+            torch.tensor([[20.0, 20.0, 80.0, 80.0]]) if "shirt" in prompt
+            else torch.tensor([[0.0, 0.0, 100.0, 100.0]])
+        )
+        sam_calls = []
+
+        class FakeInputs(dict):
+            def __getattr__(self, key):
+                return self[key]
+            def to(self, device):
+                return self
+
+        class FakeProc:
+            def __call__(self, **kwargs):
+                out = {"pixel_values": torch.zeros((1, 3, 4, 4)), "original_sizes": torch.tensor([[100, 100]]), "reshaped_input_sizes": torch.tensor([[100, 100]])}
+                if "input_boxes" in kwargs:
+                    out["input_boxes"] = torch.tensor(kwargs["input_boxes"])
+                if "input_points" in kwargs:
+                    out["input_points"] = torch.tensor(kwargs["input_points"])
+                    out["input_labels"] = torch.tensor(kwargs["input_labels"])
+                return FakeInputs(out)
+            image_processor = SimpleNamespace(
+                post_process_masks=lambda pred, orig, reshaped: [torch.ones((1, 1, 100, 100), dtype=torch.bool)]
+            )
+
+        class FakeSAM:
+            def get_image_embeddings(self, pv):
+                return torch.zeros((1, 1))
+            def __call__(self, **kwargs):
+                sam_calls.append(kwargs)
+                return SimpleNamespace(pred_masks=torch.ones((1, 1, 100, 100)))
+
+        seg.sam_processor = FakeProc()
+        seg.sam = FakeSAM()
+        result = seg.segment(Image.new("RGB", (100, 100), "white"))
+        # Only the clothing box should have been passed to SAM (giant exclude box dropped), WITH input_points/input_labels!
+        self.assertEqual(len(sam_calls), 1)
+        self.assertIn("input_points", sam_calls[0])
+        self.assertIn("input_labels", sam_calls[0])
+        self.assertGreater(np.count_nonzero(np.asarray(result)), 0)
+
+    def test_sam_detects_from_painted_guide_mask_even_when_text_detects_nothing(self):
+        if not HAS_IMAGES or importlib.util.find_spec("torch") is None:
+            self.skipTest("torch/PIL/numpy required")
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        guide = Image.new("L", (120, 120), 0)
+        guide.paste(255, (30, 40, 90, 95))
+        seg = object.__new__(generator.GroundedSAM)
+        seg.device = "cpu"
+        seg.args = SimpleNamespace(
+            mask_prompt="bloomers",
+            exclude_prompt="",
+            mask_points=[],
+            guide_mask=guide,
+        )
+        # GroundingDINO finds 0 boxes, yet SAM must still run from the painted area!
+        seg.detect = lambda image, prompt: torch.empty((0, 4), dtype=torch.float32)
+        sam_calls = []
+
+        class FakeInputs(dict):
+            def __getattr__(self, key):
+                return self[key]
+            def to(self, device):
+                return self
+
+        class FakeProc:
+            def __call__(self, **kwargs):
+                out = {"pixel_values": torch.zeros((1, 3, 4, 4)), "original_sizes": torch.tensor([[120, 120]]), "reshaped_input_sizes": torch.tensor([[120, 120]])}
+                if "input_boxes" in kwargs:
+                    out["input_boxes"] = torch.tensor(kwargs["input_boxes"])
+                if "input_points" in kwargs:
+                    out["input_points"] = torch.tensor(kwargs["input_points"])
+                    out["input_labels"] = torch.tensor(kwargs["input_labels"])
+                return FakeInputs(out)
+            image_processor = SimpleNamespace(
+                post_process_masks=lambda pred, orig, reshaped: [torch.ones((1, 1, 120, 120), dtype=torch.bool)]
+            )
+
+        class FakeSAM:
+            def get_image_embeddings(self, pv):
+                return torch.zeros((1, 1))
+            def __call__(self, **kwargs):
+                sam_calls.append(kwargs)
+                return SimpleNamespace(pred_masks=torch.ones((1, 1, 120, 120)))
+
+        seg.sam_processor = FakeProc()
+        seg.sam = FakeSAM()
+        result = seg.segment(Image.new("RGB", (120, 120), "white"))
+        self.assertEqual(len(sam_calls), 1)
+        self.assertIn("input_points", sam_calls[0])
+        self.assertEqual(sam_calls[0]["input_points"].shape[-2], 8)  # sampled interior points from painted area
+        self.assertGreater(np.count_nonzero(np.asarray(result)), 0)

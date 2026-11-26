@@ -54,6 +54,15 @@ class PublishTests(unittest.TestCase):
         self.assertNotEqual(first["lora_dir"], second["lora_dir"])
         self.assertTrue(second["subfolder"].startswith("look_"))
 
+    def test_overwrite_replaces_same_name_files_in_place(self):
+        first = comfy_setup.publish_lora(self.output, "look", str(self.root / "loras"))
+        (self.output / "look-step00000500.safetensors").unlink()
+        (self.output / "look.safetensors").write_bytes(b"updated")
+        second = comfy_setup.publish_lora(self.output, "look", str(self.root / "loras"), overwrite=True)
+        self.assertEqual(first["lora_dir"], second["lora_dir"])
+        self.assertEqual(sorted(second["files"]), ["look-step00000250.safetensors", "look.safetensors"])
+        self.assertEqual((Path(second["lora_dir"]) / "look.safetensors").read_bytes(), b"updated")
+
     def test_no_lora_file_is_an_error(self):
         with self.assertRaisesRegex(ValueError, "No LoRA files"):
             comfy_setup.publish_lora(self.output, "missing", str(self.root / "loras"))

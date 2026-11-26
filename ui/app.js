@@ -1,4 +1,5 @@
 import { BUILTIN_PRESETS, DEFAULT_PARAMS, OPTIMIZERS, PARAM_FIELDS, PARAM_SCHEMA, SCHEDULERS, builtinPreset, optimizerInfo, parseSpeed, summaryModel, updateSpeed } from "./training-params.mjs";
+import { buildConfigDocument, parseConfigDocument } from "./config-file.mjs";
 import { buildTrialWorkflow, folderFor, loaderScript, NEEDS, supportsWorkflow, trialPrompt } from "./comfy-workflow.mjs";
 import { COMPONENT_KEYS, DEFAULT_FAMILY, FAMILIES, civitaiMismatch, downloadById, downloadItems, familyById, familyParams, normalizeDownloadLink, presetById, presetsFor } from "./model-families.mjs";
 import { PROJECT_DEFAULTS, TRAINING_DEFAULTS, required, validateTraining, applyJobEvent, makeTrainingProfile, readTrainingProfile, normalizePresetName, readPresetStore, upsertPreset, removePreset, serializePresetStore } from "./state.mjs";
@@ -11,6 +12,8 @@ import { isTqdmLine, newJobUi, parseTqdm, progressModel, reduceJobUi } from "./j
 import { PROJECTS_KEY, createProject, deleteProject, newStore, readStore, renameProject, setActive, updateProjectData } from "./projects.mjs";
 import { getMaskColor, hexToRgb, setMaskColor } from "./mask-color.mjs";
 import { readPageZoom, stepPageZoom } from "./page-zoom.mjs";
+import { clampLogWidth, DEFAULT_LOG_WIDTH, LOG_WIDTH_KEY, parseTheme, THEME_KEY } from "./theme.mjs";
+import { BUILTIN_MASK_PRESETS, DEFAULT_MASK_PRESET, MASK_PRESET_KEY, findMaskPreset, normalizeMaskPresetName, readMaskPresetStore, removeMaskPreset, serializeMaskPresetStore, upsertMaskPreset } from "./mask-presets.mjs";
 
 const byId = (id) => document.getElementById(id);
 const native = window.__TAURI__;
@@ -31,7 +34,7 @@ document.addEventListener("input", (event) => {
   field.setSelectionRange(selectionStart, selectionEnd);
 }, true);
 
-const PATH_KEYS = new Set(["raw_dir", "mask_dir", "caption_dir", "dataset_dir", "train_masks", "training_dir", ...COMPONENT_KEYS]);
+const PATH_KEYS = new Set(["raw_dir", "mask_dir", "caption_dir", "dataset_dir", "train_masks", "training_dir", "sample_checkpoint", ...COMPONENT_KEYS]);
 let project = { ...PROJECT_DEFAULTS };
 try {
   const stored = JSON.parse(localStorage.getItem("costume-project") || "{}");
@@ -55,8 +58,24 @@ let previewGeneration = 0;
 const lines = [];
 
 function notice(message) {
-  byId("notice").textContent = String(message);
-  byId("notice").hidden = !message;
+  const el = byId("notice");
+  const text = String(message ?? "").trim();
+  if (!text) {
+    el.hidden = true;
+    el.replaceChildren();
+    return;
+  }
+  const body = document.createElement("span");
+  body.className = "notice-text";
+  body.textContent = text;
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "notice-close";
+  close.setAttribute("aria-label", "Dismiss notice");
+  close.textContent = "×";
+  close.addEventListener("click", () => notice(""));
+  el.replaceChildren(body, close);
+  el.hidden = false;
 }
 
 function saveProject() {
@@ -66,12 +85,22 @@ function saveProject() {
   });
 }
 
+function repairTrainMasks() {
+  if (!project.dataset_dir || !project.raw_dir || !project.mask_dir) return;
+  if (rootKey(project.dataset_dir) !== rootKey(project.raw_dir)) return;
+  const autoMasks = rootKey(project.dataset_dir) + "/masks";
+  if (!project.train_masks || rootKey(project.train_masks) === autoMasks) {
+    project.train_masks = project.mask_dir;
+  }
+}
+
 document.querySelectorAll("[data-project]").forEach((input) => {
   input.value = project[input.dataset.project];
   input.addEventListener("input", () => {
     project[input.dataset.project] = input.value;
     if (input.dataset.project === "dataset_dir") {
-      project.train_masks = input.value ? input.value.replace(/[\\/]+$/, "") + "/masks" : "";
+      const sameAsRaw = input.value && project.raw_dir && rootKey(input.value) === rootKey(project.raw_dir);
+      project.train_masks = sameAsRaw && project.mask_dir ? project.mask_dir : (input.value ? input.value.replace(/[\\/]+$/, "") + "/masks" : "");
     }
     saveProject();
   });
@@ -547,6 +576,82 @@ byId("delete-profile").addEventListener("click", () => {
   } catch (error) { notice(error); }
 });
 
+function sampleFormValues() {
+  return {
+    every_n_epochs: Number(byId("sample-every-n-epochs").value) || 0,
+    checkpoint: (project.sample_checkpoint ?? "").trim(),
+    lora_strength: Number(byId("sample-lora-strength").value),
+    width: Number(byId("sample-width").value),
+    height: Number(byId("sample-height").value),
+    steps: Number(byId("sample-steps").value),
+    cfg: Number(byId("sample-cfg").value),
+    sampler: byId("sample-sampler").value,
+    clip_skip: Number(byId("sample-clip-skip").value),
+    seed: Number(byId("sample-seed").value),
+    prompt: byId("sample-prompt").value,
+    negative: byId("sample-negative").value
+  };
+}
+
+function applySampleValues(sample) {
+  if (!sample) return;
+  byId("sample-every-n-epochs").value = String(sample.every_n_epochs);
+  byId("sample-lora-strength").value = String(sample.lora_strength);
+  byId("sample-width").value = String(sample.width);
+  byId("sample-height").value = String(sample.height);
+  byId("sample-steps").value = String(sample.steps);
+  byId("sample-cfg").value = String(sample.cfg);
+  byId("sample-sampler").value = sample.sampler;
+  byId("sample-clip-skip").value = String(sample.clip_skip);
+  byId("sample-seed").value = String(sample.seed);
+  byId("sample-prompt").value = sample.prompt;
+  byId("sample-negative").value = sample.negative;
+  if (sample.checkpoint) {
+    project.sample_checkpoint = toSlash(sample.checkpoint);
+    saveProject();
+  }
+  syncSampleControls();
+  if (sample.every_n_epochs > 0) byId("sample-section").open = true;
+}
+
+byId("export-config-file").addEventListener("click", async () => {
+  try {
+    const rawName = (byId("preset-name").value || project.output_name || "lora-config").trim();
+    const safeFile = rawName.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "lora-config";
+    const doc = buildConfigDocument({
+      name: byId("preset-name").value.trim() || project.output_name,
+      model_family: currentFamily().id,
+      parameters: trainingValues(),
+      sample: sampleFormValues()
+    });
+    const saved = await invoke("export_config_file", { defaultName: safeFile + ".yaml", content: doc });
+    if (!saved) return;
+    byId("profile-status").textContent = "Exported settings to " + saved;
+    notice("");
+  } catch (error) { notice(error); }
+});
+
+byId("import-config-file").addEventListener("click", async () => {
+  try {
+    const result = await invoke("import_config_file");
+    if (!result) return;
+    const loaded = parseConfigDocument(result.data);
+    if (loaded.model_family && loaded.model_family !== currentFamily().id) {
+      stashFamilyPaths(currentFamily().id);
+      restoreFamilyPaths(loaded.model_family);
+      project.model_family = loaded.model_family;
+      saveProject();
+      renderFamilyControls();
+    }
+    applyTrainingValues(loaded.parameters);
+    if (loaded.sample) applySampleValues(loaded.sample);
+    if (loaded.name) byId("preset-name").value = loaded.name;
+    byId("profile-status").textContent = "Imported " + (loaded.name ? "“" + loaded.name + "” from " : "") + result.path + ". Dataset and output folders are unchanged.";
+    notice("");
+    scheduleProjectSave();
+  } catch (error) { notice(error); }
+});
+
 document.querySelectorAll(".browse").forEach((button) => {
   button.addEventListener("click", async () => {
     try {
@@ -598,6 +703,13 @@ function renderJobBar() {
   byId("job-bar-note").textContent = model.noteText;
   byId("job-bar-note").hidden = !model.noteText;
   byId("job-bar-stop").hidden = !model.running;
+  if (model.running && model.fraction !== null) {
+    byId("progress").value = model.fraction;
+    if (!jobUi.total && jobUi.bar) {
+      const counts = jobUi.bar.doneText && jobUi.bar.totalText ? " · " + jobUi.bar.doneText + " / " + jobUi.bar.totalText : "";
+      byId("job-status").textContent = model.percentText + counts;
+    }
+  }
 }
 function startJobUi(kind) {
   clearTimeout(jobBarHideTimer);
@@ -674,6 +786,72 @@ async function run(kind, payload) {
   }
 }
 
+// --- Mask Creation segmentation presets (shared with Tools via localStorage) ---
+{
+  const select = byId("mask-preset-select");
+  const builtinGroup = byId("mask-builtin-presets");
+  const customGroup = byId("mask-custom-presets");
+  const nameInput = byId("mask-preset-name");
+  const saveBtn = byId("mask-preset-save");
+  const deleteBtn = byId("mask-preset-delete");
+  const statusEl = byId("mask-preset-status");
+  const maskPromptEl = byId("mask-prompt");
+  const excludePromptEl = byId("exclude-prompt");
+  const loadCustom = () => { try { return readMaskPresetStore(localStorage.getItem(MASK_PRESET_KEY)); } catch { return []; } };
+  const makeOpt = (value, label) => { const o = document.createElement("option"); o.value = value; o.textContent = label; return o; };
+  function renderMaskPresets(preferred) {
+    const custom = loadCustom();
+    builtinGroup.replaceChildren(...BUILTIN_MASK_PRESETS.map((p) => makeOpt("builtin:" + p.id, p.name)));
+    customGroup.replaceChildren(...custom.map((p) => makeOpt("custom:" + p.name, p.name)));
+    customGroup.hidden = custom.length === 0;
+    const wanted = preferred ?? select.value;
+    const fallback = "builtin:" + DEFAULT_MASK_PRESET.id;
+    select.value = [...select.options].some((o) => o.value === wanted) ? wanted : fallback;
+    deleteBtn.disabled = !select.value.startsWith("custom:");
+  }
+  renderMaskPresets("builtin:" + DEFAULT_MASK_PRESET.id);
+  window.addEventListener("costume-mask-presets-changed", () => renderMaskPresets());
+  select.addEventListener("change", () => {
+    const chosen = findMaskPreset(select.value, loadCustom());
+    if (!chosen) return;
+    maskPromptEl.value = chosen.mask_prompt;
+    excludePromptEl.value = chosen.exclude_prompt;
+    nameInput.value = select.value.startsWith("custom:") ? chosen.name : "";
+    deleteBtn.disabled = !select.value.startsWith("custom:");
+    statusEl.textContent = "Applied “" + chosen.name + "”.";
+    scheduleProjectSave();
+  });
+  saveBtn.addEventListener("click", () => {
+    try {
+      const custom = loadCustom();
+      const currentName = select.value.startsWith("custom:") ? (findMaskPreset(select.value, custom)?.name ?? "") : "";
+      const name = normalizeMaskPresetName(nameInput.value || currentName);
+      const overwrite = custom.some((p) => p.name === name);
+      const next = upsertMaskPreset(custom, name, maskPromptEl.value, excludePromptEl.value);
+      localStorage.setItem(MASK_PRESET_KEY, serializeMaskPresetStore(next));
+      renderMaskPresets("custom:" + name);
+      nameInput.value = name;
+      statusEl.textContent = "Preset “" + name + "” " + (overwrite ? "overwritten" : "saved") + ".";
+      window.dispatchEvent(new CustomEvent("costume-mask-presets-changed"));
+      notice("");
+    } catch (error) { notice(error); }
+  });
+  deleteBtn.addEventListener("click", () => {
+    try {
+      const custom = loadCustom();
+      const chosen = select.value.startsWith("custom:") ? findMaskPreset(select.value, custom) : null;
+      if (!chosen) return;
+      const next = removeMaskPreset(custom, chosen.name);
+      localStorage.setItem(MASK_PRESET_KEY, serializeMaskPresetStore(next));
+      renderMaskPresets("builtin:" + DEFAULT_MASK_PRESET.id);
+      nameInput.value = "";
+      statusEl.textContent = "Deleted “" + chosen.name + "”.";
+      window.dispatchEvent(new CustomEvent("costume-mask-presets-changed"));
+      notice("");
+    } catch (error) { notice(error); }
+  });
+}
+
 byId("mask-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   try {
@@ -681,7 +859,7 @@ byId("mask-form").addEventListener("submit", async (event) => {
       input_dir: required(project.raw_dir, "Source images folder"),
       output_dir: required(project.mask_dir, "Mask output"),
       mask_prompt: required(byId("mask-prompt").value, "Clothing prompt"),
-      exclude_prompt: required(byId("exclude-prompt").value, "Exclude prompt"),
+      exclude_prompt: byId("exclude-prompt").value.trim(),
       device: byId("mask-device").value
     });
   } catch (error) { notice(error); }
@@ -707,11 +885,17 @@ byId("dataset-form").addEventListener("submit", async (event) => {
 });
 
 // Images unchecked in Tools are left out of training when "Use only the images selected in Tools" is on.
+function selectionRecord() {
+  const store = loadSelectionStore();
+  const primary = getRecord(store, project.raw_dir);
+  if (primary.total > 0 || primary.excluded.length > 0) return primary;
+  return getRecord(store, project.dataset_dir);
+}
 function excludedSources() {
-  return byId("use-tools-selection").checked ? getRecord(loadSelectionStore(), project.raw_dir).excluded : [];
+  return byId("use-tools-selection").checked ? selectionRecord().excluded : [];
 }
 function updateSelectionSummary() {
-  byId("tools-selection-summary").textContent = selectionSummary(getRecord(loadSelectionStore(), project.raw_dir), byId("use-tools-selection").checked);
+  byId("tools-selection-summary").textContent = selectionSummary(selectionRecord(), byId("use-tools-selection").checked);
   updateTrainingSummary();
 }
 byId("use-tools-selection").addEventListener("change", updateSelectionSummary);
@@ -730,7 +914,7 @@ function rememberImageCount(count) {
   updateTrainingSummary();
 }
 function trainingImages() {
-  const record = getRecord(loadSelectionStore(), project.raw_dir);
+  const record = selectionRecord();
   if (record.total > 0) {
     const count = byId("use-tools-selection").checked ? Math.max(0, record.total - record.excluded.length) : record.total;
     return { count, source: "the images in Tools" };
@@ -780,6 +964,25 @@ document.getElementById("parameters-section").addEventListener("input", () => { 
 document.getElementById("parameters-section").addEventListener("change", () => { syncParameterDependencies(); updateTrainingSummary(); });
 document.querySelectorAll("[data-project=dataset_dir], [data-project=raw_dir]").forEach((input) => input.addEventListener("input", updateTrainingSummary));
 
+function syncSampleControls() {
+  const active = Number(byId("sample-every-n-epochs").value) > 0;
+  byId("sample-prompt").required = active;
+  const key = byId("sample-width").value + "x" + byId("sample-height").value;
+  const aspect = byId("sample-aspect");
+  aspect.value = [...aspect.options].some((option) => option.value === key) ? key : "custom";
+}
+byId("sample-aspect").addEventListener("change", () => {
+  const match = /^(\d+)x(\d+)$/.exec(byId("sample-aspect").value);
+  if (!match) return;
+  byId("sample-width").value = match[1];
+  byId("sample-height").value = match[2];
+});
+for (const id of ["sample-every-n-epochs", "sample-width", "sample-height"]) {
+  byId(id).addEventListener("input", syncSampleControls);
+  byId(id).addEventListener("change", syncSampleControls);
+}
+syncSampleControls();
+
 // The pre-flight check reports how many images will really be used; the training progress bar tells the speed.
 function learnFromTrainingEvent(data) {
   if (jobKind !== "train" && jobKind !== "validate") return;
@@ -794,6 +997,19 @@ renderFamilyControls();
 applyTrainingValues(TRAINING_DEFAULTS); // the form starts with the default parameters
 summaryReady = true;
 updateTrainingSummary();
+
+function confirmOverwriteOutput(message) {
+  const dialog = byId("train-overwrite-dialog");
+  byId("train-overwrite-message").textContent = message;
+  return new Promise((resolve) => {
+    const close = (result) => { dialog.close(); dialog.oncancel = null; resolve(result); };
+    byId("train-overwrite-cancel").onclick = () => close(false);
+    byId("train-overwrite-confirm").onclick = () => close(true);
+    dialog.oncancel = (event) => { event.preventDefault(); close(false); };
+    dialog.showModal();
+    byId("train-overwrite-confirm").focus();
+  });
+}
 
 async function startTraining(kind) {
   const form = byId("train-form");
@@ -814,6 +1030,7 @@ async function startTraining(kind) {
       checkpoint: required(project.checkpoint, currentFamily().components[0].label),
       dataset_dir: required(project.dataset_dir, "Dataset"),
       mask_dir: values.use_masks && !values.alpha_mask ? required(project.train_masks, "Training masks") : "",
+      caption_dir: project.caption_dir,
       output_dir: required(project.training_dir, "LoRA output"),
       output_name: required(project.output_name, "LoRA name")
     });
@@ -823,8 +1040,36 @@ async function startTraining(kind) {
       else if (item.required) throw new Error(item.label + " is required — choose the file or download it in the Model section");
     }
     for (const key of Object.keys(payload)) if (payload[key] === "") delete payload[key]; // optional empty fields use the backend defaults
+    const sampleEvery = Number(byId("sample-every-n-epochs").value);
+    if (Number.isFinite(sampleEvery) && sampleEvery > 0) {
+      payload.sample_every_n_epochs = sampleEvery;
+      payload.sample_prompt = required(byId("sample-prompt").value, "Sample prompt");
+      payload.sample_negative = byId("sample-negative").value.trim();
+      payload.sample_lora_strength = Number(byId("sample-lora-strength").value);
+      payload.sample_width = Number(byId("sample-width").value);
+      payload.sample_height = Number(byId("sample-height").value);
+      payload.sample_steps = Number(byId("sample-steps").value);
+      payload.sample_cfg = Number(byId("sample-cfg").value);
+      payload.sample_sampler = byId("sample-sampler").value;
+      payload.sample_clip_skip = Number(byId("sample-clip-skip").value);
+      payload.sample_seed = Number(byId("sample-seed").value);
+      if ((project.sample_checkpoint ?? "").trim()) payload.sample_checkpoint = project.sample_checkpoint.trim();
+    }
     const skipped = excludedSources();
     if (skipped.length) payload.excluded_sources = skipped;
+    if (native) {
+      const existing = await invoke("check_output_dir", { path: payload.output_dir, outputName: payload.output_name });
+      if (existing?.non_empty) {
+        if (kind === "train") {
+          const lead = existing.same_name
+            ? `A LoRA named “${payload.output_name}” already exists in ${payload.output_dir}.`
+            : `The output folder ${payload.output_dir} already contains files.`;
+          const ok = await confirmOverwriteOutput(lead + " Overwrite and continue?");
+          if (!ok) return;
+        }
+        payload.overwrite_output = true;
+      }
+    }
     lastRun = { batchSize: payload.batch_size, resolution: payload.resolution, family: currentFamily().id, files: currentPaths(), trigger: project.trigger_word };
     byId("train-try-comfy").hidden = true;
     await run(kind, payload);
@@ -849,6 +1094,84 @@ byId("cancel-job").addEventListener("click", async () => {
   } catch (error) { notice(error); byId("cancel-job").disabled = false; }
 });
 byId("clear-log").addEventListener("click", () => { lines.length = 0; byId("logs").textContent = ""; });
+byId("copy-log").addEventListener("click", async () => {
+  const button = byId("copy-log");
+  try {
+    await navigator.clipboard.writeText(byId("logs").textContent || "");
+    button.textContent = "Copied";
+    setTimeout(() => { button.textContent = "Copy"; }, 1400);
+  } catch { /* clipboard unavailable */ }
+});
+const LOG_DOCK_KEY = "costume-log-dock-hidden";
+function setLogDockHidden(hidden) {
+  byId("app-shell").classList.toggle("log-hidden", hidden);
+  byId("log-dock").hidden = hidden;
+  byId("log-resizer").hidden = hidden;
+  byId("log-dock-open").hidden = !hidden;
+  try { localStorage.setItem(LOG_DOCK_KEY, hidden ? "1" : "0"); } catch { /* storage unavailable */ }
+}
+byId("log-dock-close").addEventListener("click", () => setLogDockHidden(true));
+byId("log-dock-open").addEventListener("click", () => setLogDockHidden(false));
+try { if (localStorage.getItem(LOG_DOCK_KEY) === "1") setLogDockHidden(true); } catch { /* storage unavailable */ }
+
+// ---- Appearance: 4 themes (Neumorphism / Glassmorphism × Light / Dark) ----
+let uiTheme = parseTheme((() => { try { return localStorage.getItem(THEME_KEY); } catch { return null; } })());
+function applyTheme(next) {
+  uiTheme = parseTheme(next);
+  document.documentElement.dataset.style = uiTheme.style;
+  document.documentElement.dataset.mode = uiTheme.mode;
+  document.documentElement.style.colorScheme = uiTheme.mode;
+  document.querySelectorAll("[data-theme-style]").forEach((btn) => btn.setAttribute("aria-pressed", String(btn.dataset.themeStyle === uiTheme.style)));
+  document.querySelectorAll("[data-theme-mode]").forEach((btn) => btn.setAttribute("aria-pressed", String(btn.dataset.themeMode === uiTheme.mode)));
+  try { localStorage.setItem(THEME_KEY, JSON.stringify(uiTheme)); } catch { /* storage unavailable */ }
+}
+document.querySelectorAll("[data-theme-style]").forEach((btn) => btn.addEventListener("click", () => applyTheme({ ...uiTheme, style: btn.dataset.themeStyle })));
+document.querySelectorAll("[data-theme-mode]").forEach((btn) => btn.addEventListener("click", () => applyTheme({ ...uiTheme, mode: btn.dataset.themeMode })));
+applyTheme(uiTheme);
+
+// ---- Draggable splitter between settings workspace and right log dock ----
+let logDockWidth = DEFAULT_LOG_WIDTH;
+function applyLogWidth(width, persist = true) {
+  logDockWidth = clampLogWidth(width, window.innerWidth);
+  document.documentElement.style.setProperty("--log-width", logDockWidth + "px");
+  if (persist) { try { localStorage.setItem(LOG_WIDTH_KEY, String(logDockWidth)); } catch { /* storage unavailable */ } }
+}
+try {
+  const storedWidth = localStorage.getItem(LOG_WIDTH_KEY);
+  if (storedWidth) applyLogWidth(Number(storedWidth), false);
+} catch { /* storage unavailable */ }
+window.addEventListener("resize", () => applyLogWidth(logDockWidth, false));
+
+const logResizer = byId("log-resizer");
+let dragState = null;
+logResizer.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  dragState = { startX: event.clientX, startWidth: byId("log-dock").getBoundingClientRect().width || logDockWidth };
+  logResizer.classList.add("dragging");
+  document.body.classList.add("resizing-dock");
+  logResizer.setPointerCapture?.(event.pointerId);
+});
+logResizer.addEventListener("pointermove", (event) => {
+  if (!dragState) return;
+  applyLogWidth(dragState.startWidth + (dragState.startX - event.clientX), false);
+});
+function endDockDrag(event) {
+  if (!dragState) return;
+  dragState = null;
+  logResizer.classList.remove("dragging");
+  document.body.classList.remove("resizing-dock");
+  if (event?.pointerId !== undefined) try { logResizer.releasePointerCapture?.(event.pointerId); } catch { /* ignore */ }
+  applyLogWidth(logDockWidth, true);
+}
+logResizer.addEventListener("pointerup", endDockDrag);
+logResizer.addEventListener("pointercancel", endDockDrag);
+logResizer.addEventListener("dblclick", () => applyLogWidth(DEFAULT_LOG_WIDTH, true));
+logResizer.addEventListener("keydown", (event) => {
+  if (event.key === "ArrowLeft") { event.preventDefault(); applyLogWidth(logDockWidth + 28, true); }
+  else if (event.key === "ArrowRight") { event.preventDefault(); applyLogWidth(logDockWidth - 28, true); }
+  else if (event.key === "Home") { event.preventDefault(); applyLogWidth(DEFAULT_LOG_WIDTH, true); }
+});
 
 function imageFromURL(url) {
   return new Promise((resolve, reject) => {
@@ -1206,8 +1529,10 @@ function applyProjectData(data) {
     for (const key of Object.keys(PROJECT_DEFAULTS)) {
       project[key] = typeof saved[key] === "string" ? (PATH_KEYS.has(key) ? toSlash(saved[key]) : saved[key]) : PROJECT_DEFAULTS[key];
     }
+    repairTrainMasks();
     saveProject();
     renderFamilyControls();
+    syncSampleControls();
     // Sliders drive read-outs and redraws through their input handlers.
     document.querySelectorAll('#page-train input[type="range"], #page-mask input[type="range"], #page-tools input[type="range"]')
       .forEach((range) => range.dispatchEvent(new Event("input", { bubbles: true })));
@@ -1303,7 +1628,7 @@ byId("project-delete").addEventListener("click", () => {
 
 projectStore = readStore(localStorage.getItem(PROJECTS_KEY));
 if (projectStore) applyProjectData(activeProject().data);
-else { projectStore = newStore("My project", collectProjectData()); persistProjects(); }
+else { repairTrainMasks(); saveProject(); projectStore = newStore("My project", collectProjectData()); persistProjects(); }
 renderProjectSelect();
 updateSelectionSummary();
 showProjectStatus("Autosave on");

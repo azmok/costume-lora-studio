@@ -19,7 +19,7 @@ test("names are trimmed, defaulted and the built-in name is reserved", () => {
 });
 
 test("invalid parameters are rejected and corrupted stored entries are skipped", () => {
-  assert.throws(() => upsertPreset([], "bad", { ...TRAINING_DEFAULTS, rank: 8, alpha: 16 }));
+  assert.throws(() => upsertPreset([], "bad", { ...TRAINING_DEFAULTS, rank: 8, alpha: 600 }));
   const raw = JSON.stringify({ schema_version: 1, presets: [{ name: "ok", parameters: TRAINING_DEFAULTS }, { name: "broken", parameters: { steps: -1 } }] });
   assert.deepEqual(readPresetStore(raw).map((p) => p.name), ["ok"]);
   assert.deepEqual(readPresetStore("not json"), []);

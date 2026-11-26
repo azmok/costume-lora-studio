@@ -27,7 +27,8 @@ export function parseTqdm(line) {
   return {
     label, percent: Math.min(100, Number(percent[1])),
     doneText: counts ? counts[1].trim() : "", totalText: counts ? counts[2].trim() : "",
-    rate: timing?.[3]?.trim() ?? "", eta: timing && timing[2] !== "?" ? timing[2] : ""
+    rate: timing?.[3] && !timing[3].includes("?") ? timing[3].trim() : "",
+    eta: timing && !timing[2].includes("?") ? timing[2] : ""
   };
 }
 export const isTqdmLine = (line) => parseTqdm(line) !== null;
