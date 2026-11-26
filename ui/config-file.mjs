@@ -3,6 +3,34 @@ import { DEFAULT_PARAMS, validateParams } from "./training-params.mjs";
 import { DEFAULT_FAMILY, familyById } from "./model-families.mjs";
 
 export const CONFIG_SCHEMA_VERSION = 1;
+
+export function deriveSiblingDirs(datasetDir) {
+  const clean = String(datasetDir ?? "").trim().replaceAll("\\", "/").replace(/\/+$/, "");
+  if (!clean) return { dataset_dir: "", mask_dir: "", output_dir: "" };
+  const slash = clean.lastIndexOf("/");
+  let base;
+  if (slash > 0) base = clean.slice(0, slash);
+  else if (slash === 0) base = "";
+  else if (/^[A-Za-z]:$/.test(clean)) base = clean;
+  else return { dataset_dir: clean, mask_dir: "mask", output_dir: "lora" };
+  return {
+    dataset_dir: clean,
+    mask_dir: base + "/mask",
+    output_dir: base + "/lora"
+  };
+}
+
+function cleanOptionalPath(value, label) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(label + " must be a valid path string");
+  return value.trim().replaceAll("\\", "/").replace(/\/+$/, "");
+}
+
+function cleanOptionalName(value) {
+  if (value === undefined || value === null || value === "") return "";
+  if (typeof value !== "string" || value.includes("\0")) throw new Error("output_name must be a valid string");
+  return value.trim().slice(0, 80);
+}
 export const SAMPLE_DEFAULTS = {
   every_n_epochs: 1,
   checkpoint: "",
@@ -68,14 +96,18 @@ function sanitizeSample(raw) {
   };
 }
 
-export function buildConfigDocument({ name = "", model_family = DEFAULT_FAMILY, parameters = {}, sample = null } = {}) {
+export function buildConfigDocument({ name = "", model_family = DEFAULT_FAMILY, parameters = {}, sample = null, dataset_dir = "", output_name = "" } = {}) {
   const family = familyById(model_family)?.id ?? DEFAULT_FAMILY;
   const checked = validateParams({ ...DEFAULT_PARAMS, ...parameters });
   const cleanParams = Object.fromEntries(Object.keys(DEFAULT_PARAMS).map((key) => [key, checked[key]]));
+  const cleanDataset = cleanOptionalPath(dataset_dir, "dataset_dir");
+  const cleanOutputName = cleanOptionalName(output_name);
   const doc = {
     schema_version: CONFIG_SCHEMA_VERSION,
     ...(String(name ?? "").trim() ? { name: String(name).trim() } : {}),
     model_family: family,
+    ...(cleanDataset ? { dataset_dir: cleanDataset } : {}),
+    ...(cleanOutputName ? { output_name: cleanOutputName } : {}),
     parameters: cleanParams
   };
   if (sample) doc.sample = sanitizeSample(sample);
@@ -99,7 +131,12 @@ export function parseConfigDocument(raw) {
       normalized[mapped] = value;
     }
   }
-  if (!Object.keys(normalized).length && !raw.sample) {
+  const folders = raw.folders && typeof raw.folders === "object" && !Array.isArray(raw.folders) ? raw.folders : {};
+  const rawDataset = cleanOptionalPath(raw.dataset_dir ?? folders.dataset_dir, "dataset_dir");
+  const explicitMask = cleanOptionalPath(raw.mask_dir ?? folders.mask_dir, "mask_dir");
+  const explicitOutput = cleanOptionalPath(raw.output_dir ?? folders.output_dir, "output_dir");
+  const output_name = cleanOptionalName(raw.output_name ?? folders.output_name);
+  if (!Object.keys(normalized).length && !raw.sample && !rawDataset) {
     throw new Error("No recognized training parameters were found in this file");
   }
   const validated = validateParams({ ...DEFAULT_PARAMS, ...normalized });
@@ -107,5 +144,15 @@ export function parseConfigDocument(raw) {
   const family = typeof raw.model_family === "string" && familyById(raw.model_family) ? raw.model_family : null;
   const sample = raw.sample ? sanitizeSample(raw.sample) : null;
   const name = typeof raw.name === "string" ? raw.name.trim().slice(0, 60) : "";
-  return { name, model_family: family, parameters, sample };
+  const derived = deriveSiblingDirs(rawDataset);
+  return {
+    name,
+    model_family: family,
+    parameters,
+    sample,
+    dataset_dir: derived.dataset_dir,
+    mask_dir: explicitMask || derived.mask_dir,
+    output_dir: explicitOutput || derived.output_dir,
+    output_name
+  };
 }

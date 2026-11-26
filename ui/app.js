@@ -1,5 +1,5 @@
 import { BUILTIN_PRESETS, DEFAULT_PARAMS, OPTIMIZERS, PARAM_FIELDS, PARAM_SCHEMA, SCHEDULERS, builtinPreset, optimizerInfo, parseSpeed, summaryModel, updateSpeed } from "./training-params.mjs";
-import { buildConfigDocument, parseConfigDocument } from "./config-file.mjs";
+import { buildConfigDocument, deriveSiblingDirs, parseConfigDocument } from "./config-file.mjs";
 import { buildTrialWorkflow, folderFor, loaderScript, NEEDS, supportsWorkflow, trialPrompt } from "./comfy-workflow.mjs";
 import { COMPONENT_KEYS, DEFAULT_FAMILY, FAMILIES, civitaiMismatch, downloadById, downloadItems, familyById, familyParams, normalizeDownloadLink, presetById, presetsFor } from "./model-families.mjs";
 import { PROJECT_DEFAULTS, TRAINING_DEFAULTS, required, validateTraining, applyJobEvent, makeTrainingProfile, readTrainingProfile, normalizePresetName, readPresetStore, upsertPreset, removePreset, serializePresetStore } from "./state.mjs";
@@ -100,10 +100,12 @@ document.querySelectorAll("[data-project]").forEach((input) => {
   input.addEventListener("input", () => {
     project[input.dataset.project] = input.value;
     if (input.dataset.project === "dataset_dir") {
-      const sameAsRaw = input.value && project.raw_dir && rootKey(input.value) === rootKey(project.raw_dir);
-      project.train_masks = sameAsRaw && project.mask_dir ? project.mask_dir : (input.value ? input.value.replace(/[\\/]+$/, "") + "/masks" : "");
+      const derived = deriveSiblingDirs(input.value);
+      project.train_masks = derived.mask_dir;
+      project.training_dir = derived.output_dir;
     }
     saveProject();
+    if (input.dataset.project === "dataset_dir") updateSelectionSummary();
   });
 });
 
@@ -622,6 +624,8 @@ byId("export-config-file").addEventListener("click", async () => {
     const doc = buildConfigDocument({
       name: byId("preset-name").value.trim() || project.output_name,
       model_family: currentFamily().id,
+      dataset_dir: project.dataset_dir,
+      output_name: project.output_name,
       parameters: trainingValues(),
       sample: sampleFormValues()
     });
@@ -644,10 +648,22 @@ byId("import-config-file").addEventListener("click", async () => {
       saveProject();
       renderFamilyControls();
     }
+    let foldersUpdated = false;
+    if (loaded.dataset_dir) {
+      project.dataset_dir = loaded.dataset_dir;
+      project.train_masks = loaded.mask_dir;
+      project.training_dir = loaded.output_dir;
+      foldersUpdated = true;
+    }
+    if (loaded.output_name) project.output_name = loaded.output_name;
+    if (foldersUpdated || loaded.output_name) {
+      saveProject();
+      updateSelectionSummary();
+    }
     applyTrainingValues(loaded.parameters);
     if (loaded.sample) applySampleValues(loaded.sample);
     if (loaded.name) byId("preset-name").value = loaded.name;
-    byId("profile-status").textContent = "Imported " + (loaded.name ? "“" + loaded.name + "” from " : "") + result.path + ". Dataset and output folders are unchanged.";
+    byId("profile-status").textContent = "Imported " + (loaded.name ? "“" + loaded.name + "” from " : "") + result.path + (foldersUpdated ? ". Dataset, mask and LoRA folders updated." : ". Dataset and output folders are unchanged.");
     notice("");
     scheduleProjectSave();
   } catch (error) { notice(error); }
