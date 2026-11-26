@@ -19,3 +19,6 @@ vendor/
 .training-env/
 dist/
 settings.yaml
+
+# AI 共通の脳（非公開の azmok/ai-brains）。手元の PC では scripts/ai-learning.mjs がここにクローンする
+/ai-brains/
