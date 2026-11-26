@@ -769,6 +769,102 @@ async fn save_tool_mask(request: ToolFileRequest) -> Result<String, String> {
     .map_err(|error| error.to_string())?
 }
 
+#[derive(Serialize)]
+struct CaptionEntry {
+    relative: String,
+    image: String,
+    caption: String,
+}
+
+#[tauri::command]
+async fn load_caption_entries(root: String, caption_dir: String) -> Result<Vec<CaptionEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if root.trim().is_empty() || !Path::new(&root).is_dir() {
+            return Err("Choose the source images folder".into());
+        }
+        let root_path = fs::canonicalize(&root).map_err(|error| error.to_string())?;
+        let mut raw_entries = Vec::new();
+        collect_images(
+            &root_path,
+            &root_path,
+            Path::new(""),
+            &mut raw_entries,
+        )?;
+        raw_entries.sort_by(|left, right| left.relative.cmp(&right.relative));
+        let cap_root = caption_dir.trim();
+        let mut result = Vec::with_capacity(raw_entries.len());
+        for entry in raw_entries {
+            let image_path = PathBuf::from(&entry.image);
+            let txt_path = if cap_root.is_empty() {
+                image_path.with_extension("txt")
+            } else {
+                let rel = image_path.strip_prefix(&root_path).unwrap_or(Path::new(&entry.relative));
+                Path::new(cap_root).join(rel).with_extension("txt")
+            };
+            let caption = if txt_path.is_file() {
+                let meta = fs::metadata(&txt_path).map_err(|error| error.to_string())?;
+                if meta.len() > 64_000 {
+                    return Err(format!("Caption file is too long: {}", txt_path.display()));
+                }
+                fs::read_to_string(&txt_path)
+                    .map_err(|error| error.to_string())?
+                    .trim()
+                    .to_string()
+            } else {
+                String::new()
+            };
+            result.push(CaptionEntry {
+                relative: entry.relative,
+                image: entry.image,
+                caption,
+            });
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn save_manual_caption(request: ToolFileRequest) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if request.content.contains('\0') || request.content.len() > 64_000 {
+            return Err("The caption must be valid UTF-8 text (up to 64 KB)".into());
+        }
+        let path = tool_output(&request, "txt")?;
+        let text = request.content.trim();
+        let bytes = if text.is_empty() {
+            Vec::new()
+        } else {
+            format!("{text}\n").into_bytes()
+        };
+        write_tool_file(&path, &bytes)?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn open_manual_captioner_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("manual-captioner") {
+        let _ = window.unminimize();
+        window.show().map_err(|e| e.to_string())?;
+        return window.set_focus().map_err(|e| e.to_string());
+    }
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "manual-captioner",
+        tauri::WebviewUrl::App("manual-captioner.html".into()),
+    )
+    .title("Manual Captioner — Costume LoRA Studio")
+    .inner_size(1480.0, 940.0)
+    .min_inner_size(900.0, 620.0)
+    .build()
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn save_tool_caption(request: ToolFileRequest) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -899,6 +995,9 @@ fn main() {
             save_tool_mask,
             save_tool_caption,
             load_tool_caption,
+            load_caption_entries,
+            save_manual_caption,
+            open_manual_captioner_window,
             comfy::app_config,
             comfy::comfy_status,
             comfy::comfy_start,

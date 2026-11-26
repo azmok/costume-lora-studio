@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en" data-style="studio" data-mode="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Manual Captioner — Costume LoRA Studio</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="manual-captioner.css">
+  <script type="module" src="manual-captioner.js"></script>
+</head>
+<body class="mc-body">
+  <header class="app-header mc-header">
+    <div class="brand-row">
+      <div>
+        <h1>Manual Captioner</h1>
+        <p>Gallery caption editor with tag navigation, inline rename/delete, and bulk text tools · auto-saves .txt files on blur or Ctrl+Enter</p>
+      </div>
+      <div class="header-info">
+        <div class="theme-switcher" role="group" aria-label="UI theme">
+          <div class="theme-pill" role="group" aria-label="Surface style">
+            <button type="button" data-theme-style="studio" aria-pressed="true" title="High-contrast studio theme">Studio</button>
+            <button type="button" data-theme-style="neu" aria-pressed="false" title="Soft Neumorphism">Soft</button>
+            <button type="button" data-theme-style="glass" aria-pressed="false" title="Frosted Glassmorphism">Glass</button>
+          </div>
+          <div class="theme-pill" role="group" aria-label="Color mode">
+            <button type="button" data-theme-mode="light" aria-pressed="true" title="Light theme">Light</button>
+            <button type="button" data-theme-mode="dark" aria-pressed="false" title="Dark theme">Dark</button>
+          </div>
+        </div>
+        <span id="mc-mode-badge" class="badge">Folder mode</span>
+      </div>
+    </div>
+  </header>
+
+  <div id="mc-toast" class="mc-toast" role="status" aria-live="polite" hidden></div>
+
+  <div class="mc-layout">
+    <main class="mc-main">
+      <section class="panel mc-source-panel" aria-label="Dataset source">
+        <div class="mc-folder-grid">
+          <div>
+            <label for="mc-root">Source images folder</label>
+            <div class="path-field">
+              <input id="mc-root" placeholder="D:/datasets/my-costume/img">
+              <button type="button" id="mc-browse-root" class="secondary">Choose</button>
+              <button type="button" id="mc-load-btn" class="primary">Load folder</button>
+            </div>
+          </div>
+          <div>
+            <label for="mc-caption-dir">Caption output folder <span>Leave empty to edit .txt next to each image</span></label>
+            <div class="path-field">
+              <input id="mc-caption-dir" placeholder="Empty = save .txt beside each image">
+              <button type="button" id="mc-browse-caption" class="secondary">Choose</button>
+            </div>
+          </div>
+        </div>
+        <details class="mc-drop-details" id="mc-drop-details">
+          <summary>Or drag &amp; drop local image + .txt files (scratch preview mode)</summary>
+          <div id="mc-upload-area" class="mc-upload-area" tabindex="0" role="button" aria-label="Drop or select images and caption text files">
+            <input id="mc-file-input" type="file" multiple accept="image/*,.txt" hidden>
+            <strong>Drag &amp; Drop Images + .txt Caption Files Here</strong>
+            <p class="help">Pairs matching filenames automatically (e.g. photo01.jpg + photo01.txt). For direct disk saving, load a folder above.</p>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel mc-progress-bar-panel" aria-label="Captioning progress">
+        <span id="mc-image-count" class="mc-stat">0 images</span>
+        <div class="mc-progress-track"><div id="mc-progress-fill" class="mc-progress-fill"></div></div>
+        <span id="mc-captioned-count" class="mc-stat">0 captioned</span>
+      </section>
+
+      <div id="mc-gallery" class="mc-gallery" hidden></div>
+
+      <section id="mc-empty" class="panel mc-empty">
+        <h3>Ready to edit captions</h3>
+        <p class="help">Choose a dataset folder above and click <strong>Load folder</strong> (or drop image + .txt files) to start editing.</p>
+      </section>
+    </main>
+
+    <aside id="mc-side-panel" class="panel mc-side-panel" aria-label="Tags and bulk caption tools">
+      <div id="mc-side-handle" class="mc-side-handle" role="separator" aria-orientation="vertical" aria-label="Resize side panel" tabindex="0" title="Drag to resize side panel · Double-click to reset"></div>
+
+      <div class="mc-side-section mc-tags-section">
+        <div class="mc-side-heading">
+          <h3>Tags &amp; Sentences</h3>
+          <span id="mc-tag-total" class="muted">0 tags</span>
+        </div>
+        <input id="mc-tag-filter" type="search" class="mc-side-input" placeholder="Filter tags…" aria-label="Filter tags">
+        <ul id="mc-tag-list" class="mc-tag-list"></ul>
+      </div>
+
+      <div id="mc-bulk-tools" class="mc-bulk-tools" hidden>
+        <section class="mc-tool-box" aria-label="Search and Replace">
+          <h4>Search and Replace</h4>
+          <input id="mc-sr-search" type="text" class="mc-side-input" placeholder="Search for…">
+          <input id="mc-sr-replace" type="text" class="mc-side-input" placeholder="Replace with…">
+          <div class="mc-option-row">
+            <label class="check-label"><input type="checkbox" id="mc-sr-regex">Use Regex</label>
+            <label class="check-label"><input type="checkbox" id="mc-sr-case">Case Sensitive</label>
+          </div>
+          <button id="mc-sr-btn" type="button" class="primary full-width">Replace All</button>
+        </section>
+
+        <section class="mc-tool-box" aria-label="Add Common Caption">
+          <h4>Add Common Caption</h4>
+          <textarea id="mc-bulk-common" rows="2" placeholder="Enter a tag or caption to append to all images…"></textarea>
+          <button id="mc-bulk-common-btn" type="button" class="primary full-width">Append to All</button>
+        </section>
+
+        <section class="mc-tool-box" aria-label="Append or Prepend Text">
+          <h4>Append / Prepend Text</h4>
+          <div class="mc-option-row" role="radiogroup" aria-label="Match type">
+            <label class="check-label"><input type="radio" name="mc-ap-type" id="mc-ap-text" value="text" checked>Text</label>
+            <label class="check-label"><input type="radio" name="mc-ap-type" id="mc-ap-regex" value="regex">Regex</label>
+          </div>
+          <input id="mc-ap-target" type="text" class="mc-side-input" placeholder="Target text / pattern">
+          <input id="mc-ap-new" type="text" class="mc-side-input" placeholder="New tag / sentence">
+          <div class="mc-option-row" role="radiogroup" aria-label="Insertion position">
+            <label class="check-label"><input type="radio" name="mc-ap-pos" id="mc-ap-prepend" value="prepend" checked>Prepend</label>
+            <label class="check-label"><input type="radio" name="mc-ap-pos" id="mc-ap-append" value="append">Append</label>
+          </div>
+          <button id="mc-ap-btn" type="button" class="secondary full-width">Add to Target</button>
+        </section>
+
+        <section class="mc-tool-box mc-tool-danger" aria-label="Delete Text">
+          <h4>Delete Text</h4>
+          <div class="mc-option-row" role="radiogroup" aria-label="Delete match type">
+            <label class="check-label"><input type="radio" name="mc-del-type" id="mc-del-text" value="text" checked>Text</label>
+            <label class="check-label"><input type="radio" name="mc-del-type" id="mc-del-regex" value="regex">Regex</label>
+          </div>
+          <input id="mc-del-target" type="text" class="mc-side-input" placeholder="Target text / pattern to delete">
+          <button id="mc-del-btn" type="button" class="mc-danger-btn full-width">Delete</button>
+        </section>
+      </div>
+
+      <div class="mc-side-footer">
+        <button id="mc-reload-btn" type="button" class="secondary full-width" disabled>Reload folder</button>
+        <button id="mc-clear-btn" type="button" class="mc-danger-btn full-width" disabled>Clear view</button>
+      </div>
+    </aside>
+  </div>
+
+  <div id="mc-lightbox" class="mc-lightbox" role="dialog" aria-modal="true" aria-label="Full size preview" hidden>
+    <figure class="mc-lightbox-inner">
+      <img id="mc-lightbox-img" src="" alt="Full view">
+      <figcaption id="mc-lightbox-name"></figcaption>
+    </figure>
+  </div>
+
+  <dialog id="mc-confirm-dialog" class="project-dialog">
+    <h3 id="mc-confirm-title">Confirm bulk edit</h3>
+    <p id="mc-confirm-message" class="help"></p>
+    <div class="actions">
+      <button id="mc-confirm-cancel" type="button">Cancel</button>
+      <button id="mc-confirm-ok" type="button" class="primary">Continue</button>
+    </div>
+  </dialog>
+</body>
+</html>

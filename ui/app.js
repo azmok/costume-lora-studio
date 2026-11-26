@@ -141,6 +141,17 @@ pageTabs.forEach((button, index) => {
   });
 });
 
+byId("tab-manual-captioner").addEventListener("click", async () => {
+  try {
+    saveProject();
+    if (native) {
+      await invoke("open_manual_captioner_window");
+    } else {
+      window.open("manual-captioner.html", "manual-captioner", "width=1440,height=920");
+    }
+  } catch (error) { notice(error); }
+});
+
 document.querySelectorAll("[data-section]").forEach((button) => {
   button.addEventListener("click", () => {
     const section = byId(button.dataset.section);

@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="ja" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SD1.5 衣装LoRA 学習＆データセット作成ハンドブック · Costume LoRA Studio</title>
+  <style>
+    :root {
+      --bg: #0f131a;
+      --surface: #171c26;
+      --surface-2: #1e2533;
+      --border: rgba(255, 255, 255, 0.09);
+      --text: #e2e8f0;
+      --text-strong: #f8fafc;
+      --muted: #94a3b8;
+      --accent: #6c8cff;
+      --accent-soft: rgba(108, 140, 255, 0.14);
+      --accent-border: rgba(108, 140, 255, 0.42);
+      --ok: #34d399;
+      --ok-soft: rgba(52, 211, 153, 0.13);
+      --warn: #fbbf24;
+      --warn-soft: rgba(251, 191, 36, 0.13);
+      --danger: #f87171;
+      --danger-soft: rgba(248, 113, 113, 0.13);
+      --mono: "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+      --sans: "Segoe UI Variable", "Segoe UI", "Yu Gothic UI", Meiryo, sans-serif;
+    }
+    html[data-theme="light"] {
+      --bg: #f1f5f9;
+      --surface: #ffffff;
+      --surface-2: #f8fafc;
+      --border: rgba(15, 23, 42, 0.1);
+      --text: #334155;
+      --text-strong: #0f172a;
+      --muted: #64748b;
+      --accent: #4361ee;
+      --accent-soft: rgba(67, 97, 238, 0.1);
+      --accent-border: rgba(67, 97, 238, 0.35);
+      --ok: #15803d;
+      --ok-soft: rgba(21, 128, 61, 0.1);
+      --warn: #b45309;
+      --warn-soft: rgba(180, 83, 9, 0.1);
+      --danger: #b91c1c;
+      --danger-soft: rgba(185, 28, 28, 0.1);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      font-size: 15px;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: color-mix(in srgb, var(--bg) 88%, transparent);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .brand { display: flex; flex-direction: column; gap: 2px; }
+    .brand h1 { margin: 0; font-size: 18px; color: var(--text-strong); letter-spacing: -0.01em; }
+    .brand small { color: var(--muted); font-size: 12px; }
+    .theme-btn {
+      background: var(--surface);
+      color: var(--text-strong);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 7px 14px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .theme-btn:hover { border-color: var(--accent-border); }
+
+    .layout {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 24px 20px 80px;
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr);
+      gap: 24px;
+      align-items: start;
+    }
+    nav.toc {
+      position: sticky;
+      top: 84px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    nav.toc h2 {
+      margin: 0 0 10px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    nav.toc a {
+      display: block;
+      padding: 7px 10px;
+      border-radius: 8px;
+      color: var(--text);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 2px;
+    }
+    nav.toc a:hover { background: var(--accent-soft); color: var(--accent); }
+
+    main { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+    section.card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px 26px;
+      scroll-margin-top: 86px;
+    }
+    .sec-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      margin-bottom: 16px;
+    }
+    .sec-head h2 { margin: 0; font-size: 20px; color: var(--text-strong); }
+    .pill {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 3px 10px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid var(--accent-border);
+      white-space: nowrap;
+    }
+    h3 { margin: 20px 0 8px; font-size: 15px; color: var(--text-strong); }
+    p { margin: 0 0 12px; }
+    ul, ol { margin: 0 0 14px; padding-left: 22px; }
+    li { margin-bottom: 6px; }
+    code {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      padding: 1px 6px;
+      border-radius: 5px;
+      color: var(--text-strong);
+    }
+    pre {
+      margin: 10px 0 16px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      line-height: 1.55;
+      color: var(--text-strong);
+    }
+
+    .callout {
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin: 14px 0;
+      border: 1px solid var(--border);
+      font-size: 14px;
+    }
+    .callout.info { background: var(--accent-soft); border-color: var(--accent-border); }
+    .callout.ok { background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+    .callout.warn { background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+    .callout.danger { background: var(--danger-soft); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+    .callout strong { color: var(--text-strong); }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 16px;
+      font-size: 13.5px;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th {
+      background: var(--surface-2);
+      color: var(--text-strong);
+      font-weight: 700;
+      font-size: 12.5px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin: 12px 0;
+    }
+    .mini-box {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+    .mini-box h4 { margin: 0 0 8px; font-size: 14px; color: var(--text-strong); }
+
+    .checklist { list-style: none; padding-left: 0; }
+    .checklist li {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--surface-2);
+      margin-bottom: 8px;
+    }
+    .checklist input[type="checkbox"] {
+      margin-top: 4px;
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .checklist li.done label { text-decoration: line-through; opacity: 0.6; }
+
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      nav.toc { position: static; }
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>SD1.5 衣装LoRA 学習＆データセット作成ハンドブック</h1>
+      <small>Costume LoRA Studio 実践メモ（いつでもオフラインで見返せるリファレンス）· 更新: 2026-11-27</small>
+    </div>
+    <button type="button" id="theme-toggle" class="theme-btn">ライト表示に切替</button>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="目次">
+      <h2>目次</h2>
+      <a href="#clip-skip">1. Clip skip（1 vs 2）の理由</a>
+      <a href="#masks">2. マスク学習の仕組みとコツ</a>
+      <a href="#captions">3. キャプション設計＆属性分離</a>
+      <a href="#params">4. おすすめ学習パラメータ表</a>
+      <a href="#tools">5. アプリ機能＆Manual Captioner</a>
+      <a href="#checklist">6. 学習開始前 5秒チェック</a>
+    </nav>
+
+    <main>
+      <!-- 1. Clip skip -->
+      <section id="clip-skip" class="card">
+        <div class="sec-head">
+          <h2>1. なぜ Clip skip 2 でトレーニングするのか？</h2>
+          <span class="pill">超重要</span>
+        </div>
+        <div class="callout info">
+          <strong>合言葉：</strong>「本番（ComfyUI）で生成するときの Clip skip ＝ 学習時の Clip skip に揃える」
+        </div>
+        <p>SD1.5 のテキスト解釈装置（CLIP Text Encoder）は <strong>12層</strong> のブロックでできています。</p>
+        <ul>
+          <li><code>Clip skip 1</code>：最後の <strong>12層目</strong> の出力を使う（素の SD1.5 や完全実写系モデルの標準）</li>
+          <li><code>Clip skip 2</code>：1つ手前の <strong>11層目</strong> の出力を使う（最後の1層をスキップ）</li>
+        </ul>
+        <div class="grid-2">
+          <div class="mini-box">
+            <h4>Clip skip 2 にする理由（アニメ・マージ系）</h4>
+            <ul>
+              <li><code>kimchiMix</code> など NovelAI 系譜のアニメ／美少女マージ系モデルは、そもそも <strong>Clip skip 2 前提</strong> で推論される。</li>
+              <li>学習が 1・生成が 2 だとテキスト空間が1層ズレて、トリガーや <code>red buruma</code> / <code>navy cuffs</code> などのタグがボケる。</li>
+              <li>11層目は文章全体より <strong>カンマ区切りの Danbooru タグ個別の意味</strong> が素直に残りやすく、属性分離 LoRA と相性が良い。</li>
+            </ul>
+          </div>
+          <div class="mini-box">
+            <h4>Clip skip 1 にすべき例外</h4>
+            <ul>
+              <li><code>RealisticVision</code> など <strong>完全実写系 SD1.5 モデル</strong> を ComfyUI でもずっと Clip skip 1 で使うなら、学習も <strong>Clip skip 1</strong> に揃える。</li>
+              <li>※ SDXL / FLUX / SD3.5 のようなフロー系・別アーキテクチャでは Clip skip 設定自体は不要（アプリ側で自動無視される）。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- 2. Masks -->
+      <section id="masks" class="card">
+        <div class="sec-head">
+          <h2>2. マスク学習（masked_loss）の仕組みと割り切りライン</h2>
+          <span class="pill">品質のキモ</span>
+        </div>
+        <p>
+          マスク学習では、<strong>白（255）＝学習する衣装エリア</strong>、<strong>黒（0）＝学習しないエリア（顔・髪・背景）</strong> として誤差計算に重みを掛けます。
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:26%">気になるポイント</th>
+              <th style="width:18%">判定</th>
+              <th>理由と実運用のコツ</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>衣装のフチから少しはみ出し（数px〜15px / 3〜5%）</td>
+              <td><strong>むしろプラス</strong></td>
+              <td>SD1.5 は学習時に画像を <strong>1/8（512px → 64×64）</strong> に圧縮してマスクを当てる。ギリギリすぎると布と肌の境目（食い込み・ゴムの影・シワ）が学習から漏れて衣装が浮きやすい。少し大きめの方が自然に馴染む。</td>
+            </tr>
+            <tr>
+              <td>衣装の上にかかってる細い毛先（数枚だけ）</td>
+              <td><strong>ほぼ問題なし</strong></td>
+              <td>データセット全体で髪型・髪色がバラけていれば平均化される。1px単位で神経質に消す必要はない。</td>
+            </tr>
+            <tr>
+              <td>顔・大きな髪の塊・腕や脚が丸ごと白い</td>
+              <td><strong>絶対NG（要修正）</strong></td>
+              <td>トリガーワードに別キャラの顔・髪型・ポーズまで引っ張られる最大の原因。顔と手足だけは確実に黒く抜く。</td>
+            </tr>
+            <tr>
+              <td>画面端の別キャラの服・背景のゴミ</td>
+              <td><strong>なるべく消す</strong></td>
+              <td>不要な領域に損失が割かれるため、消しゴムでザッと削ると学習が安定する。</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout ok">
+          <strong>コスパ最強のマスク作成手順：</strong>Tools で <strong>一括自動マスク</strong> を回す → 綺麗に出た画像に <strong>Mロック</strong> を付ける → 顔や手足が白く残った画像だけ <strong>画面外ブラシ（Photoshop風）</strong> でザッと削る。
+        </div>
+      </section>
+
+      <!-- 3. Captions -->
+      <section id="captions" class="card">
+        <div class="sec-head">
+          <h2>3. キャプション設計＆色・袖のタグ分離（Disentanglement）</h2>
+          <span class="pill">応用テク</span>
+        </div>
+        <p>
+          <code>masked_loss</code> は誤差計算を白部分だけに限定しますが、<code>text_encoder_lr &gt; 0</code> で Text Encoder も更新されるため、<strong>マスク外の無関係なタグがキャプションに大量に入っているとトークンが薄まりノイズになります</strong>。
+        </p>
+
+        <h3>マスク学習の最強キャプション：残すのは「4グループ」だけ</h3>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:24%">グループ</th>
+              <th style="width:36%">入れるタグの例</th>
+              <th>役割</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. トリガー（先頭固定）</strong></td>
+              <td><code>burumaGymUniform</code></td>
+              <td><code>keep_tokens = 1</code> で常に先頭に固定し、衣装の「形・フィット感・食い込み・生地感」を吸わせる。</td>
+            </tr>
+            <tr>
+              <td><strong>2. 衣装バリエーション</strong><br><small>（マスク内の属性）</small></td>
+              <td><code>white gym shirt</code>, <code>plain white gym shirt</code>, <code>navy collar</code>, <code>navy cuffs</code>, <code>red collar</code>, <code>red cuffs</code>, <code>navy buruma</code>, <code>red buruma</code>, <code>green buruma</code>, <code>white side stripes</code>, <code>clothes lift</code></td>
+              <td>色や袖・襟ラインを短い定型タグで分離。<strong>デフォルトの紺にも必ず <code>navy buruma</code> を書く</strong>のが分離を成功させる鉄則！</td>
+            </tr>
+            <tr>
+              <td><strong>3. 構図・角度・ポーズ</strong></td>
+              <td><code>1girl</code>, <code>solo</code>, <code>from front</code>, <code>from behind</code>, <code>from side</code>, <code>standing</code>, <code>sitting</code>, <code>kneeling</code>, <code>bent over</code>, <code>on all fours</code>, <code>close up</code>, <code>lower body</code>, <code>ass focus</code>, <code>crotch</code></td>
+              <td>衣装の見え方・シワ・ハイレグの伸び方を正しく学習させるために必須。</td>
+            </tr>
+            <tr>
+              <td><strong>4. 質感・大枠の光</strong></td>
+              <td><code>realistic</code>, <code>photorealistic</code>, <code>indoors</code>, <code>outdoors</code></td>
+              <td>実写素材でアニメモデル用の LoRA を作るとき、実写の布質感を <code>realistic</code> 側に逃がす（生成時に省けば綺麗なアニメ調になる）。</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="callout danger">
+          <strong>削るべきマスク外ノイズ（WD14 が自動で付けがち）：</strong><br>
+          髪・顔・目・表情（<code>black hair</code>, <code>twintails</code>, <code>brown eyes</code>, <code>smile</code>, <code>teeth</code>, <code>mole</code>, <code>asian</code>）、背景の細かい物（<code>tree</code>, <code>window</code>, <code>curtains</code>, <code>potted plant</code>, <code>vaulting horse</code>, <code>volleyball</code>）、靴・靴下・ネイル（<code>shoes</code>, <code>sneakers</code>, <code>socks</code>, <code>nail polish</code>）。
+        </div>
+
+        <h3>属性分離（色・袖違い）を成功させる3つのルール</h3>
+        <ol>
+          <li><strong>長い英語文ではなく短い定型タグに統一</strong>（例：<code>white gym shirt, red collar, red cuffs, red buruma</code>）。</li>
+          <li><strong>デフォルト色にも必ずタグを書く</strong>（赤だけ <code>red buruma</code> で紺を無記入にすると、トリガー側に紺が焼き付いて色が混ざる）。</li>
+          <li><strong>1バリエーションあたり最低 6〜8枚以上（理想 10枚〜）</strong> あると別ポーズでも安定して切り替わる。</li>
+        </ol>
+
+        <h3>きれいなキャプション実例</h3>
+        <pre>burumaGymUniform, white gym shirt, red collar, red cuffs, navy buruma, 1girl, solo, from front, standing, cowboy shot, indoors, realistic, photorealistic
+burumaGymUniform, maroon buruma, cameltoe, 1girl, solo, from front, close up, lower body, crotch, spread legs, thighs, realistic, photorealistic</pre>
+      </section>
+
+      <!-- 4. Parameters -->
+      <section id="params" class="card">
+        <div class="sec-head">
+          <h2>4. おすすめ SD1.5 マスク衣装LoRA パラメータ表</h2>
+          <span class="pill">実測ベース</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:28%">項目</th>
+              <th style="width:26%">おすすめ値</th>
+              <th>意図・ポイント</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Base Checkpoint</td>
+              <td><code>v1-5-pruned.safetensors</code></td>
+              <td>汎用ベースで学習すると、どのアニメ／マージ系モデル（<code>kimchiMix</code> 等）にも綺麗に乗る。</td>
+            </tr>
+            <tr>
+              <td>Resolution / Precision</td>
+              <td><code>512</code> / <code>fp16</code></td>
+              <td>SD1.5 の標準解像度＋バケッティング自動対応。</td>
+            </tr>
+            <tr>
+              <td>Rank / Alpha</td>
+              <td><code>32 / 16</code>（実効 0.5）</td>
+              <td>衣装の細かいシワ・ライン・複数色タグを十分に記憶しつつ過学習しにくいバランス。</td>
+            </tr>
+            <tr>
+              <td>Optimizer / Scheduler</td>
+              <td><code>AdamW8bit</code> / <code>cosine</code> (warmup <code>5%</code>)</td>
+              <td>省 VRAM で安定。後半に向けて学習率が綺麗に減衰する。</td>
+            </tr>
+            <tr>
+              <td>Learning Rate / TE LR</td>
+              <td>UNet <code>0.00015</code> / TE <code>0.00005</code></td>
+              <td>色・袖などのタグ分離を効かせたいときは TE LR <code>5e-5</code>（単一特化なら <code>4e-5</code> でも◎）。</td>
+            </tr>
+            <tr>
+              <td>Min-SNR / Noise Offset</td>
+              <td><code>5</code> / <code>0.05</code></td>
+              <td>収束の安定化と、紺・黒ブルマなどの暗部コントラスト表現を改善。</td>
+            </tr>
+            <tr>
+              <td>Clip skip / Shuffle / Keep</td>
+              <td><code>2</code> / <code>ON</code> / <code>1</code></td>
+              <td>先頭トリガーだけ固定して残りのタグをシャッフルすることで、ポーズと衣装の癒着を防ぐ。</td>
+            </tr>
+            <tr>
+              <td>Save / Sample every N</td>
+              <td><code>1</code> / <code>1</code>（全エポック）</td>
+              <td>1エポックごとに重み保存＆<code>kimchiMix</code>（strength <code>0.8</code>, <code>dpmsolver++</code>）で逐次サンプル出力してベストエポックを目視選定。</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>枚数ごとの Batch / Repeats / Epochs 目安（目標 1,400〜2,000 steps）</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>データセット枚数</th>
+              <th>Batch size</th>
+              <th>Repeats</th>
+              <th>Epochs</th>
+              <th>合計ステップ数</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>40〜50枚（例：<code>buru4-2</code> 44枚）</td>
+              <td><code>2</code></td>
+              <td><code>6</code></td>
+              <td><code>10〜12</code></td>
+              <td>約 1,320〜1,584 steps（ベストは Epoch 7〜10 あたりに出やすい）</td>
+            </tr>
+            <tr>
+              <td>80〜100枚（例：<code>buru5</code> 89枚）</td>
+              <td><code>2</code></td>
+              <td><code>4</code></td>
+              <td><code>10</code></td>
+              <td>約 1,780 steps（多色・多ポーズでもバランスよく収束）</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- 5. App workflow -->
+      <section id="tools" class="card">
+        <div class="sec-head">
+          <h2>5. Costume LoRA Studio 便利機能＆Manual Captioner</h2>
+          <span class="pill">時短ワザ</span>
+        </div>
+        <div class="grid-2">
+          <div class="mini-box">
+            <h4>Manual Captioner（別ウィンドウ）</h4>
+            <ul>
+              <li>上の <strong>Manual Captioner</strong> タブをクリックすると別ウィンドウで起動（テーマもリアルタイム同期）。</li>
+              <li><strong>自動保存あり（Folder mode）：</strong>
+                <ul>
+                  <li>テキスト欄を編集してフォーカスを外す（<code>blur</code>）か <code>Ctrl + Enter</code> で <code>.txt</code> に自動保存（右上に <code>Saved</code> 表示）。</li>
+                  <li>タグの <code>Modify</code> / <code>Delete</code>、<code>Search &amp; Replace</code>、<code>Add Common Caption</code>、<code>Append / Prepend</code>、<code>Delete Text</code> も確定した瞬間に全 <code>.txt</code> へ自動保存。</li>
+                </ul>
+              </li>
+              <li>※ 折りたたみの「Drag &amp; Drop」だけはフォルダ無しのお試しモードなのでディスク保存はされへん（実データ編集は必ず上の <strong>Load folder</strong> から開く）。</li>
+            </ul>
+          </div>
+          <div class="mini-box">
+            <h4>Tools ＆ プリセット自動連携</h4>
+            <ul>
+              <li><strong>Cロック / Mロック：</strong>画像リスト右の鍵ボタン。ロック中は AI 自動生成・一括上書き（上書きチェックONでも）・一括タグ挿入から保護される（手動編集と保存はOK）。</li>
+              <li><strong>画面外ブラシ：</strong>画像の外側からそのままドラッグしてフチ塗りできる。</li>
+              <li><strong><code>dataset_dir</code> 同階層自動セット：</strong>Dataset folder に <code>.../buru5/img</code> を入れる（または <code>dataset_dir</code> 入り YAML を Import する）だけで、同階層の <code>.../mask</code> と <code>.../lora</code> が自動セット。</li>
+              <li><strong>1エポック逐次サンプル出力：</strong>学習中、1エポック保存されるたびに裏で即 <code>sample/</code> へ画像を出力（VRAM不足時は学習を止めず終了後に自動リトライ）。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6. Pre-flight checklist -->
+      <section id="checklist" class="card">
+        <div class="sec-head">
+          <h2>6. 学習開始前 5秒チェックリスト</h2>
+          <span class="pill">事故防止</span>
+        </div>
+        <p class="muted">クリックでチェックを入れられるで（毎回 Start training の直前にここだけ確認すると事故ゼロ！）：</p>
+        <ul class="checklist" id="preflight-list">
+          <li><input type="checkbox" id="c1"><label for="c1"><strong>フォルダが今回のデータセットになっているか？</strong>（<code>dataset_dir</code> / <code>mask</code> / <code>lora</code> が古い <code>buru2</code> 等のままになってないか）</label></li>
+          <li><input type="checkbox" id="c2"><label for="c2"><strong><code>Use masks</code> が ON になっているか？</strong>（OFF だと背景や顔まで全部学習してしまう）</label></li>
+          <li><input type="checkbox" id="c3"><label for="c3"><strong>Tools で除外した画像を使う場合、<code>Use only the images selected in Tools</code> が ON か？</strong>（別フォルダに厳選コピー済みなら OFF でOK）</label></li>
+          <li><input type="checkbox" id="c4"><label for="c4"><strong><code>Clip skip</code> が本番 ComfyUI と一致しているか？</strong>（アニメ／マージ系なら <code>2</code>）</label></li>
+          <li><input type="checkbox" id="c5"><label for="c5"><strong><code>Output name</code> と <code>Sample checkpoint</code> が意図通りか？</strong>（<code>buruma-05</code> / <code>kimchiMix</code> など）</label></li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const html = document.documentElement;
+    const toggle = document.getElementById("theme-toggle");
+    function setTheme(next) {
+      html.dataset.theme = next;
+      toggle.textContent = next === "dark" ? "ライト表示に切替" : "ダーク表示に切替";
+      try { localStorage.setItem("costume-doc-theme", next); } catch {}
+    }
+    try {
+      const saved = localStorage.getItem("costume-doc-theme");
+      if (saved === "light" || saved === "dark") setTheme(saved);
+    } catch {}
+    toggle.addEventListener("click", () => setTheme(html.dataset.theme === "dark" ? "light" : "dark"));
+
+    document.querySelectorAll("#preflight-list input[type=checkbox]").forEach((cb) => {
+      cb.addEventListener("change", () => cb.closest("li").classList.toggle("done", cb.checked));
+    });
+  </script>
+</body>
+</html>
